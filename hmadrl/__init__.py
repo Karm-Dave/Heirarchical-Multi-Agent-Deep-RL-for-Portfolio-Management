@@ -1,7 +1,9 @@
 """HMADRL package."""
 
+from .config import ProjectConfig, load_config
 from .factory import build_hierarchical_agent, build_top_manager
 from .hierarchy import HierarchicalDecision, HierarchicalPortfolioAgent
+from .pipeline import BacktestMetrics, TrainingResult, run_training
 from .spaces import (
     DomainAction,
     DomainState,
@@ -25,5 +27,9 @@ __all__ = [
     "HierarchicalPortfolioAgent",
     "build_top_manager",
     "build_hierarchical_agent",
+    "ProjectConfig",
+    "load_config",
+    "BacktestMetrics",
+    "TrainingResult",
+    "run_training",
 ]
-

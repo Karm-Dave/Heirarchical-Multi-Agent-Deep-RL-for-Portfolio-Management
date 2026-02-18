@@ -1,0 +1,24 @@
+{
+  "top_mode": "rl",
+  "domain_to_stocks": {
+    "technology": ["AAPL", "MSFT", "NVDA"],
+    "finance": ["JPM", "BAC", "GS"],
+    "healthcare": ["JNJ", "PFE", "UNH"]
+  },
+  "rl": {
+    "max_domain_hold_steps": 8,
+    "max_stock_hold_steps": 5,
+    "random_seed": 42,
+    "training_steps": 50,
+    "stochastic_actions": true
+  },
+  "data": {
+    "start_date": "2023-01-01",
+    "end_date": "2025-12-31",
+    "interval": "1d",
+    "provider": "auto",
+    "lookback": 20,
+    "train_split": 0.7,
+    "cache_dir": "data_cache"
+  }
+}
