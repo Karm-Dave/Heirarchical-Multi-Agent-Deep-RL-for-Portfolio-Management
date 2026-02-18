@@ -29,11 +29,31 @@ class DataConfig:
 
 
 @dataclass(frozen=True)
+class StochasticControlConfig:
+    risk_aversion: float
+    hold_scale: float
+    uncertainty_penalty: float
+    mean_reversion_speed: float
+    max_single_stock_weight: float
+    min_domain_allocation: float
+
+
+@dataclass(frozen=True)
+class ExperimentConfig:
+    results_dir: str
+    run_name: str
+    modes: list[str]
+    seeds: list[int]
+
+
+@dataclass(frozen=True)
 class ProjectConfig:
     top_mode: str
     domain_to_stocks: dict[str, list[str]]
     rl: RLConfig
     data: DataConfig
+    stochastic_control: StochasticControlConfig
+    experiments: ExperimentConfig
 
 
 def _require_keys(payload: dict[str, Any], keys: list[str], scope: str) -> None:
@@ -59,6 +79,10 @@ def load_config(path: str | Path) -> ProjectConfig:
         "rl",
     )
     _require_keys(raw["data"], ["start_date", "end_date", "interval"], "data")
+    stochastic_raw = dict(raw.get("stochastic_control", {}))
+    experiments_raw = dict(raw.get("experiments", {}))
+    modes = [str(m) for m in experiments_raw.get("modes", [str(raw["top_mode"])])]
+    seeds = [int(s) for s in experiments_raw.get("seeds", [int(raw["rl"]["random_seed"])])]
 
     return ProjectConfig(
         top_mode=str(raw["top_mode"]),
@@ -81,5 +105,19 @@ def load_config(path: str | Path) -> ProjectConfig:
             lookback=int(raw["data"].get("lookback", 20)),
             train_split=float(raw["data"].get("train_split", 0.7)),
             cache_dir=str(raw["data"].get("cache_dir", "data_cache")),
+        ),
+        stochastic_control=StochasticControlConfig(
+            risk_aversion=float(stochastic_raw.get("risk_aversion", 3.0)),
+            hold_scale=float(stochastic_raw.get("hold_scale", 1.0)),
+            uncertainty_penalty=float(stochastic_raw.get("uncertainty_penalty", 0.35)),
+            mean_reversion_speed=float(stochastic_raw.get("mean_reversion_speed", 0.15)),
+            max_single_stock_weight=float(stochastic_raw.get("max_single_stock_weight", 0.45)),
+            min_domain_allocation=float(stochastic_raw.get("min_domain_allocation", 0.01)),
+        ),
+        experiments=ExperimentConfig(
+            results_dir=str(experiments_raw.get("results_dir", "results")),
+            run_name=str(experiments_raw.get("run_name", "hmadrl")),
+            modes=modes,
+            seeds=seeds,
         ),
     )

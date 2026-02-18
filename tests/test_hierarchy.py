@@ -1,5 +1,6 @@
 import unittest
 
+from hmadrl.config import StochasticControlConfig
 from hmadrl.factory import build_hierarchical_agent
 from hmadrl.spaces import DomainState, TopLevelState
 
@@ -15,6 +16,14 @@ class TestHierarchy(unittest.TestCase):
             domain_to_stocks=domain_to_stocks,
             max_domain_hold_steps=6,
             max_stock_hold_steps=4,
+            stochastic_control=StochasticControlConfig(
+                risk_aversion=3.0,
+                hold_scale=1.0,
+                uncertainty_penalty=0.35,
+                mean_reversion_speed=0.15,
+                max_single_stock_weight=0.6,
+                min_domain_allocation=0.01,
+            ),
             seed=5,
         )
 
@@ -51,12 +60,15 @@ class TestHierarchy(unittest.TestCase):
         decision = agent.decide(top_state=top_state, domain_states=domain_states, stochastic=False)
         self.assertTrue(decision.final_stock_weights)
         self.assertAlmostEqual(sum(decision.final_stock_weights.values()), 1.0, places=6)
+        self.assertAlmostEqual(sum(decision.final_domain_weights.values()), 1.0, places=6)
 
         for domain, domain_action in decision.domain_actions.items():
             self.assertLessEqual(domain_action.hold_steps, decision.top_action.hold_steps)
             self.assertIn(domain, decision.stock_rebalance_after_steps)
+            control = decision.domain_controls[domain]
+            for weight in domain_action.stock_weights.values():
+                self.assertLessEqual(weight, control.max_stock_weight + 1e-8)
 
 
 if __name__ == "__main__":
     unittest.main()
-

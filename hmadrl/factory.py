@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from typing import Mapping, Sequence
 
+from .config import StochasticControlConfig
 from .domain_manager import DomainRLManager
 from .hierarchy import HierarchicalPortfolioAgent
+from .stochastic_control import StochasticController
 from .top_manager import MoERouterTopManager, RLTopManager, TopManagerBase
 
 
@@ -37,6 +39,7 @@ def build_hierarchical_agent(
     domain_to_stocks: Mapping[str, Sequence[str]],
     max_domain_hold_steps: int = 8,
     max_stock_hold_steps: int = 5,
+    stochastic_control: StochasticControlConfig | None = None,
     seed: int = 0,
 ) -> HierarchicalPortfolioAgent:
     domain_names = list(domain_to_stocks.keys())
@@ -57,5 +60,17 @@ def build_hierarchical_agent(
         for domain, stocks in domain_to_stocks.items()
     }
 
-    return HierarchicalPortfolioAgent(top_manager=top_manager, domain_managers=domain_managers)
+    controller = None
+    if stochastic_control is not None:
+        controller = StochasticController(
+            domain_names=domain_names,
+            config=stochastic_control,
+            max_hold_steps=max_domain_hold_steps,
+            seed=seed,
+        )
 
+    return HierarchicalPortfolioAgent(
+        top_manager=top_manager,
+        domain_managers=domain_managers,
+        stochastic_controller=controller,
+    )

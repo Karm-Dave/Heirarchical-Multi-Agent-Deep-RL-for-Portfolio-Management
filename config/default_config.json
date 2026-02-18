@@ -1,15 +1,18 @@
 {
   "top_mode": "rl",
   "domain_to_stocks": {
-    "technology": ["AAPL", "MSFT", "NVDA"],
-    "finance": ["JPM", "BAC", "GS"],
-    "healthcare": ["JNJ", "PFE", "UNH"]
+    "technology": ["AAPL", "MSFT", "NVDA", "AVGO", "ORCL"],
+    "finance": ["JPM", "BAC", "GS", "MS", "C"],
+    "healthcare": ["JNJ", "PFE", "UNH", "MRK", "ABBV"],
+    "energy": ["XOM", "CVX", "COP", "SLB", "EOG"],
+    "industrials": ["CAT", "GE", "HON", "DE", "UPS"],
+    "consumer": ["AMZN", "WMT", "COST", "KO", "PG"]
   },
   "rl": {
     "max_domain_hold_steps": 8,
     "max_stock_hold_steps": 5,
     "random_seed": 42,
-    "training_steps": 50,
+    "training_steps": 80,
     "stochastic_actions": true
   },
   "data": {
@@ -20,5 +23,19 @@
     "lookback": 20,
     "train_split": 0.7,
     "cache_dir": "data_cache"
+  },
+  "stochastic_control": {
+    "risk_aversion": 3.0,
+    "hold_scale": 1.1,
+    "uncertainty_penalty": 0.35,
+    "mean_reversion_speed": 0.18,
+    "max_single_stock_weight": 0.45,
+    "min_domain_allocation": 0.01
+  },
+  "experiments": {
+    "results_dir": "results",
+    "run_name": "hmadrl_batch",
+    "modes": ["rl", "moe_router"],
+    "seeds": [42, 84]
   }
 }

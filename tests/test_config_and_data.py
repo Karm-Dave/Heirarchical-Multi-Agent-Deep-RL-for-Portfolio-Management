@@ -47,6 +47,8 @@ class TestConfigAndData(unittest.TestCase):
         self.assertEqual(config.data.provider, "auto")
         self.assertEqual(config.data.lookback, 20)
         self.assertEqual(config.data.train_split, 0.7)
+        self.assertEqual(config.stochastic_control.risk_aversion, 3.0)
+        self.assertEqual(config.experiments.results_dir, "results")
 
     def test_build_features_and_states(self) -> None:
         domain_to_stocks = {

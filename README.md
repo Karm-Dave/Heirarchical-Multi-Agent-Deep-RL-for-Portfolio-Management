@@ -10,6 +10,11 @@ Top layer is switchable:
 - `rl`: DQN-based top allocator.
 - `moe_router`: MoE-style router logic (router chooses expert allocator).
 
+Top-down stochastic control is active:
+
+- Portfolio manager emits domain control signals (`capital_budget`, `risk_budget`, `max_stock_weight`, `hold_steps`).
+- Domain managers must satisfy those constraints when selecting stock actions.
+
 ## State And Action Spaces
 
 ### Top Layer
@@ -45,7 +50,7 @@ Real market data is fetched through free providers (`hmadrl/data_api.py`):
 
 - `yfinance` (Yahoo)
 - `stooq` CSV endpoint
-- `auto` mode tries `yfinance` first, then `stooq`
+- `auto` mode tries `stooq` first, then `yfinance`
 
 ## Config
 
@@ -58,6 +63,8 @@ Edit `config/default_config.json` to change:
 - data range and interval
 - provider mode (`yfinance`, `stooq`, or `auto`)
 - lookback window / train-test split / cache directory
+- stochastic-control parameters
+- batch experiment settings (`modes`, `seeds`, `results_dir`, `run_name`)
 
 ## Run
 
@@ -73,14 +80,23 @@ Run tests:
 .venv\Scripts\python -m unittest discover -s tests -v
 ```
 
-Run training:
+Run batch experiments (default):
 
 ```bash
 .venv\Scripts\python run_experiment.py --config config/default_config.json
 ```
 
-The run output includes:
+Run only one experiment:
 
-- training rewards
-- training return metrics
-- test return metrics (`cumulative return`, `annualized return`, `sharpe`, `max drawdown`)
+```bash
+.venv\Scripts\python run_experiment.py --config config/default_config.json --single
+```
+
+Outputs are saved under `results/<run_name>_<timestamp>/`:
+
+- `batch_summary.csv`, `batch_summary.json`
+- per-run folder with:
+  - `summary.json`
+  - `train_returns.csv`, `test_returns.csv`, `losses.csv`
+  - `train_domain_allocations.csv`, `test_domain_allocations.csv`
+  - plots: `reward_curve.png`, `equity_curve.png`, `drawdown_curve.png`, and domain allocation charts
