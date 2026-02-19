@@ -10,8 +10,8 @@ import numpy as np
 import torch
 from torch import nn
 
-from .rl_core import DQNPolicy
-from .spaces import TopLevelAction, TopLevelState, generate_top_level_templates
+from .rl_core import PPOContinuousPolicy
+from .spaces import TopLevelAction, TopLevelState
 
 
 class TopManagerBase(ABC):
@@ -23,31 +23,94 @@ class TopManagerBase(ABC):
 
 
 class RLTopManager(TopManagerBase):
-    """Top-layer DQN that allocates across domains and chooses hold duration."""
+    """Top-layer continuous PPO allocator with optional ensembles."""
 
     def __init__(
         self,
         domain_names: Sequence[str],
         max_hold_steps: int,
+        num_global_features: int = 0,
+        min_hold_steps: int = 2,
         hidden_dims: Sequence[int] = (128, 128),
+        ensemble_size: int = 1,
+        learning_rate: float = 3e-4,
+        clip_ratio: float = 0.2,
+        entropy_coef: float = 1e-3,
+        ppo_epochs: int = 4,
+        hold_inertia: float = 0.75,
         seed: int = 0,
     ) -> None:
         self.domain_names = list(domain_names)
-        self.templates = generate_top_level_templates(self.domain_names, max_hold_steps)
-        self._template_index = {action.action_id: i for i, action in enumerate(self.templates)}
-        state_dim = TopLevelState.vector_size(len(self.domain_names))
+        state_dim = TopLevelState.vector_size(len(self.domain_names), num_global_features=num_global_features)
+        self._state_dim = state_dim
+        self._ensemble_size = max(1, int(ensemble_size))
 
-        self.policy = DQNPolicy(
-            state_dim=state_dim,
-            action_dim=len(self.templates),
-            hidden_dims=hidden_dims,
-            seed=seed,
-        )
+        self.policies = [
+            PPOContinuousPolicy(
+                state_dim=state_dim,
+                simplex_dim=len(self.domain_names),
+                hidden_dims=hidden_dims,
+                learning_rate=learning_rate,
+                clip_ratio=clip_ratio,
+                entropy_coef=entropy_coef,
+                epochs=ppo_epochs,
+                min_hold_steps=min_hold_steps,
+                max_hold_steps=max_hold_steps,
+                hold_inertia=hold_inertia,
+                seed=seed + i * 17,
+            )
+            for i in range(self._ensemble_size)
+        ]
+        self._last_action_vecs: list[np.ndarray] = []
+        self._last_logprobs: list[float] = []
+        self._last_values: list[float] = []
+
+    def _extend_state(self, state: TopLevelState) -> np.ndarray:
+        vector = np.asarray(state.to_vector(self.domain_names), dtype=np.float32)
+        if vector.shape[0] < self._state_dim:
+            padded = np.zeros(self._state_dim, dtype=np.float32)
+            padded[: vector.shape[0]] = vector
+            return padded
+        if vector.shape[0] > self._state_dim:
+            return vector[: self._state_dim]
+        return vector
 
     def act(self, state: TopLevelState, stochastic: bool = True) -> TopLevelAction:
-        vector = np.asarray(state.to_vector(self.domain_names), dtype=np.float32)
-        index = self.policy.select_action(vector, stochastic=stochastic)
-        return self.templates[index]
+        vector = self._extend_state(state)
+        weights_list: list[np.ndarray] = []
+        holds: list[int] = []
+        action_vecs: list[np.ndarray] = []
+        logprobs: list[float] = []
+        values: list[float] = []
+        entropies: list[float] = []
+
+        for policy in self.policies:
+            weights, hold_steps, action_vec, logprob, value, entropy = policy.select_action(
+                vector,
+                stochastic=stochastic,
+            )
+            weights_list.append(weights)
+            holds.append(hold_steps)
+            action_vecs.append(action_vec)
+            logprobs.append(logprob)
+            values.append(value)
+            entropies.append(entropy)
+
+        avg_weights = np.mean(np.stack(weights_list, axis=0), axis=0)
+        avg_weights = np.maximum(avg_weights, 1e-8)
+        avg_weights = avg_weights / float(np.sum(avg_weights))
+        hold_steps = int(round(float(np.mean(holds))))
+        uncertainty = float(np.std(np.stack(weights_list, axis=0), axis=0).mean() + np.mean(entropies))
+
+        self._last_action_vecs = action_vecs
+        self._last_logprobs = logprobs
+        self._last_values = values
+        return TopLevelAction(
+            domain_weights={domain: float(avg_weights[i]) for i, domain in enumerate(self.domain_names)},
+            hold_steps=hold_steps,
+            action_id="top_continuous_ppo",
+            uncertainty=uncertainty,
+        ).normalized()
 
     def remember(
         self,
@@ -57,17 +120,26 @@ class RLTopManager(TopManagerBase):
         next_state: TopLevelState,
         done: bool,
     ) -> None:
-        index = self._template_index[action.action_id]
-        self.policy.store(
-            state=state.to_vector(self.domain_names),
-            action=index,
-            reward=reward,
-            next_state=next_state.to_vector(self.domain_names),
-            done=done,
-        )
+        del action, next_state
+        vector = self._extend_state(state)
+        for idx, policy in enumerate(self.policies):
+            if idx >= len(self._last_action_vecs):
+                continue
+            policy.remember(
+                state=vector,
+                action_vec=self._last_action_vecs[idx],
+                logprob=self._last_logprobs[idx],
+                value=self._last_values[idx],
+                reward=reward,
+                done=done,
+            )
 
     def learn(self) -> float | None:
-        return self.policy.train_step()
+        losses = [policy.learn() for policy in self.policies]
+        valid = [loss for loss in losses if loss is not None]
+        if not valid:
+            return None
+        return float(np.mean(valid))
 
 
 class RouterNetwork(nn.Module):
@@ -90,6 +162,7 @@ class MoERouterTopManager(TopManagerBase):
         self,
         domain_names: Sequence[str],
         max_hold_steps: int,
+        num_global_features: int = 0,
         seed: int = 0,
         train_router: bool = False,
     ) -> None:
@@ -99,7 +172,7 @@ class MoERouterTopManager(TopManagerBase):
         self.train_router = train_router
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        state_dim = TopLevelState.vector_size(len(self.domain_names))
+        state_dim = TopLevelState.vector_size(len(self.domain_names), num_global_features=num_global_features)
         self.router = RouterNetwork(state_dim=state_dim, num_experts=3).to(self.device)
         self.optimizer = torch.optim.Adam(self.router.parameters(), lr=1e-3)
 
@@ -132,6 +205,7 @@ class MoERouterTopManager(TopManagerBase):
             domain_weights=weights,
             hold_steps=hold_steps,
             action_id=f"moe_router_exp{expert_index}",
+            uncertainty=0.0,
         ).normalized()
 
     def update_router(self, reward: float) -> None:
@@ -169,4 +243,3 @@ class MoERouterTopManager(TopManagerBase):
         weights = {d: float(probs[i]) for i, d in enumerate(self.domain_names)}
         hold = max(1, min(self.max_hold_steps, state.remaining_horizon_steps // 3 or 1))
         return weights, hold
-

@@ -6,8 +6,8 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
-from .rl_core import DQNPolicy
-from .spaces import DomainAction, DomainState, generate_domain_templates
+from .rl_core import SACContinuousPolicy
+from .spaces import DomainAction, DomainState
 from .stochastic_control import DomainControlSignal
 
 
@@ -53,31 +53,60 @@ def _cap_weights(weights: Mapping[str, float], max_weight: float) -> dict[str, f
 
 
 class DomainRLManager:
-    """DQN domain manager: allocates among stocks and picks stock hold steps."""
+    """Continuous SAC domain manager with optional policy ensembles."""
 
     def __init__(
         self,
         domain_name: str,
         stock_names: Sequence[str],
         max_hold_steps: int,
+        num_domain_factors: int = 0,
+        min_hold_steps: int = 2,
         hidden_dims: Sequence[int] = (128, 128),
+        ensemble_size: int = 1,
+        learning_rate: float = 3e-4,
+        gamma: float = 0.99,
+        alpha: float = 0.15,
+        batch_size: int = 64,
+        replay_size: int = 20000,
+        hold_inertia: float = 0.75,
         seed: int = 0,
     ) -> None:
         self.domain_name = domain_name
         self.stock_names = list(stock_names)
-        self.templates = generate_domain_templates(
-            domain_name=domain_name,
-            stock_names=self.stock_names,
-            max_hold_steps=max_hold_steps,
+        self._state_dim = DomainState.vector_size(
+            len(self.stock_names),
+            num_domain_factors=num_domain_factors,
         )
-        self._template_index = {action.action_id: i for i, action in enumerate(self.templates)}
-        state_dim = DomainState.vector_size(len(self.stock_names))
-        self.policy = DQNPolicy(
-            state_dim=state_dim,
-            action_dim=len(self.templates),
-            hidden_dims=hidden_dims,
-            seed=seed,
-        )
+        self._ensemble_size = max(1, int(ensemble_size))
+        self.policies = [
+            SACContinuousPolicy(
+                state_dim=self._state_dim,
+                simplex_dim=len(self.stock_names),
+                hidden_dims=hidden_dims,
+                learning_rate=learning_rate,
+                gamma=gamma,
+                alpha=alpha,
+                batch_size=batch_size,
+                replay_size=replay_size,
+                min_hold_steps=min_hold_steps,
+                max_hold_steps=max_hold_steps,
+                hold_inertia=hold_inertia,
+                seed=seed + i * 31,
+            )
+            for i in range(self._ensemble_size)
+        ]
+        self._last_action_vecs: list[np.ndarray] = []
+
+    def _extend_state(self, state: DomainState) -> np.ndarray:
+        vector = np.asarray(state.to_vector(self.stock_names), dtype=np.float32)
+        if vector.shape[0] < self._state_dim:
+            padded = np.zeros(self._state_dim, dtype=np.float32)
+            padded[: vector.shape[0]] = vector
+            return padded
+        if vector.shape[0] > self._state_dim:
+            return vector[: self._state_dim]
+        return vector
 
     def act(
         self,
@@ -86,12 +115,30 @@ class DomainRLManager:
         control: DomainControlSignal | None = None,
         stochastic: bool = True,
     ) -> DomainAction:
-        vector = np.asarray(state.to_vector(self.stock_names), dtype=np.float32)
-        idx = self.policy.select_action(vector, stochastic=stochastic)
-        base_action = self.templates[idx]
+        vector = self._extend_state(state)
+        weights_list: list[np.ndarray] = []
+        holds: list[int] = []
+        uncertainties: list[float] = []
+        action_vecs: list[np.ndarray] = []
 
-        hold = min(base_action.hold_steps, max(1, parent_hold_steps))
-        stock_weights = dict(base_action.stock_weights)
+        for policy in self.policies:
+            weights, hold, action_vec, uncertainty = policy.select_action(vector, stochastic=stochastic)
+            weights_list.append(weights)
+            holds.append(hold)
+            uncertainties.append(uncertainty)
+            action_vecs.append(action_vec)
+
+        stock_weights = np.mean(np.stack(weights_list, axis=0), axis=0)
+        stock_weights = np.maximum(stock_weights, 1e-8)
+        stock_weights = stock_weights / float(np.sum(stock_weights))
+        hold = int(round(float(np.mean(holds))))
+        hold = min(hold, max(1, parent_hold_steps))
+        uncertainty = float(np.std(np.stack(weights_list, axis=0), axis=0).mean() + np.mean(uncertainties))
+        self._last_action_vecs = action_vecs
+
+        stock_weights_map = {
+            stock: float(stock_weights[i]) for i, stock in enumerate(self.stock_names)
+        }
         if control is not None:
             hold = min(hold, max(1, control.hold_steps))
 
@@ -102,16 +149,17 @@ class DomainRLManager:
             }
             inv_vol = _normalize(inv_vol)
             blend = max(0.0, min(1.0, control.risk_budget))
-            stock_weights = {
-                stock: (1.0 - blend) * stock_weights.get(stock, 0.0) + blend * inv_vol.get(stock, 0.0)
+            stock_weights_map = {
+                stock: (1.0 - blend) * stock_weights_map.get(stock, 0.0) + blend * inv_vol.get(stock, 0.0)
                 for stock in self.stock_names
             }
-            stock_weights = _cap_weights(stock_weights, control.max_stock_weight)
+            stock_weights_map = _cap_weights(stock_weights_map, control.max_stock_weight)
 
         return DomainAction(
-            stock_weights=stock_weights,
+            stock_weights=stock_weights_map,
             hold_steps=hold,
-            action_id=base_action.action_id,
+            action_id=f"{self.domain_name}_continuous_sac",
+            uncertainty=uncertainty,
         ).normalized()
 
     def remember(
@@ -122,14 +170,23 @@ class DomainRLManager:
         next_state: DomainState,
         done: bool,
     ) -> None:
-        idx = self._template_index[action.action_id]
-        self.policy.store(
-            state=state.to_vector(self.stock_names),
-            action=idx,
-            reward=reward,
-            next_state=next_state.to_vector(self.stock_names),
-            done=done,
-        )
+        del action
+        state_vec = self._extend_state(state)
+        next_state_vec = self._extend_state(next_state)
+        for idx, policy in enumerate(self.policies):
+            if idx >= len(self._last_action_vecs):
+                continue
+            policy.store(
+                state=state_vec,
+                action_vec=self._last_action_vecs[idx],
+                reward=reward,
+                next_state=next_state_vec,
+                done=done,
+            )
 
     def learn(self) -> float | None:
-        return self.policy.train_step()
+        losses = [policy.train_step() for policy in self.policies]
+        valid = [loss for loss in losses if loss is not None]
+        if not valid:
+            return None
+        return float(np.mean(valid))

@@ -60,6 +60,8 @@ class StochasticController:
         self.max_hold_steps = max(1, int(max_hold_steps))
         self.rng = random.Random(seed)
         self._latent_state = {domain: 0.0 for domain in self.domain_names}
+        mid_hold = max(1, int(round(self.max_hold_steps * 0.5)))
+        self._last_hold = {domain: mid_hold for domain in self.domain_names}
 
     def build_controls(
         self,
@@ -86,11 +88,17 @@ class StochasticController:
             sigma = float(max(1e-4, state.domain_volatility.get(domain, 1.0)))
             liq = float(max(0.0, state.domain_liquidity.get(domain, 0.0)))
             prev_alloc = float(max(0.0, state.current_allocation.get(domain, 0.0)))
+            action_uncertainty = float(max(0.0, top_action.uncertainty))
 
             # Merton fraction proxy for risky allocation intensity.
             merton = mu / (max(1e-4, self.config.risk_aversion) * sigma * sigma)
             # Uncertainty penalty increases with volatility and momentum dispersion.
-            uncertainty = sigma + self.config.uncertainty_penalty * abs(mu - momentum_mean) + 1.0 / (1.0 + liq)
+            uncertainty = (
+                sigma
+                + self.config.uncertainty_penalty * abs(mu - momentum_mean)
+                + 1.0 / (1.0 + liq)
+                + 0.25 * action_uncertainty
+            )
 
             latent_prev = self._latent_state.get(domain, 0.0)
             epsilon = self.rng.gauss(0.0, 1.0)
@@ -111,8 +119,16 @@ class StochasticController:
                 self.config.hold_scale
                 * ((mu / sigma) - self.config.uncertainty_penalty * uncertainty)
             )
-            hold_steps = int(round(top_action.hold_steps * hold_score))
-            hold_steps = max(1, min(self.max_hold_steps, min(top_action.hold_steps, hold_steps)))
+            proposed_hold = int(round(top_action.hold_steps * hold_score))
+            local_max_hold = max(1, min(self.max_hold_steps, top_action.hold_steps))
+            min_ratio = max(0.0, min(1.0, self.config.min_hold_ratio))
+            local_min_hold = max(1, min(local_max_hold, int(round(local_max_hold * min_ratio))))
+            proposed_hold = max(local_min_hold, min(local_max_hold, proposed_hold))
+            prev_hold = self._last_hold.get(domain, local_max_hold)
+            inertia = max(0.0, min(0.99, self.config.hold_inertia))
+            hold_steps = int(round(inertia * prev_hold + (1.0 - inertia) * proposed_hold))
+            hold_steps = max(local_min_hold, min(local_max_hold, hold_steps))
+            self._last_hold[domain] = hold_steps
 
             max_stock_weight = self.config.max_single_stock_weight * (0.75 + 0.25 * confidence)
             max_stock_weight = float(min(0.95, max(0.1, max_stock_weight)))

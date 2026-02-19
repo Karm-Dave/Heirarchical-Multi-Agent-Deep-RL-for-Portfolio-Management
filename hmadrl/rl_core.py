@@ -1,4 +1,4 @@
-"""PyTorch RL utilities used by top and domain managers."""
+"""PyTorch RL utilities for discrete and continuous policies."""
 
 from __future__ import annotations
 
@@ -10,6 +10,26 @@ from typing import Iterable, Sequence
 import numpy as np
 import torch
 from torch import nn
+
+
+def _mlp(
+    in_dim: int,
+    hidden_dims: Sequence[int],
+    out_dim: int,
+    activation: type[nn.Module] = nn.ReLU,
+) -> nn.Sequential:
+    layers: list[nn.Module] = []
+    prev = in_dim
+    for hidden in hidden_dims:
+        layers.append(nn.Linear(prev, hidden))
+        layers.append(activation())
+        prev = hidden
+    layers.append(nn.Linear(prev, out_dim))
+    return nn.Sequential(*layers)
+
+
+def _to_device(device: str | None) -> torch.device:
+    return torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
 
 @dataclass(frozen=True)
@@ -44,21 +64,14 @@ class QNetwork(nn.Module):
         hidden_dims: Sequence[int] = (128, 128),
     ) -> None:
         super().__init__()
-        layers: list[nn.Module] = []
-        prev = state_dim
-        for hidden in hidden_dims:
-            layers.append(nn.Linear(prev, hidden))
-            layers.append(nn.ReLU())
-            prev = hidden
-        layers.append(nn.Linear(prev, action_dim))
-        self.model = nn.Sequential(*layers)
+        self.model = _mlp(state_dim, hidden_dims, action_dim)
 
     def forward(self, state_batch: torch.Tensor) -> torch.Tensor:
         return self.model(state_batch)
 
 
 class DQNPolicy:
-    """Discrete-action DQN with softmax stochastic action selection."""
+    """Discrete-action DQN, kept for backward compatibility tests."""
 
     def __init__(
         self,
@@ -88,7 +101,7 @@ class DQNPolicy:
         self.temperature = max(1e-4, temperature)
         self.rng = random.Random(seed)
 
-        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.device = _to_device(device)
         self.q_net = QNetwork(state_dim, action_dim, hidden_dims).to(self.device)
         self.target_net = QNetwork(state_dim, action_dim, hidden_dims).to(self.device)
         self.target_net.load_state_dict(self.q_net.state_dict())
@@ -135,7 +148,6 @@ class DQNPolicy:
             return None
 
         batch = self.replay.sample(self.batch_size)
-
         states = torch.as_tensor(
             np.stack([t.state for t in batch]),
             dtype=torch.float32,
@@ -161,12 +173,418 @@ class DQNPolicy:
         nn.utils.clip_grad_norm_(self.q_net.parameters(), max_norm=5.0)
         self.optimizer.step()
 
-        self._soft_update_target()
-        self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
-        return float(loss.item())
-
-    def _soft_update_target(self) -> None:
         with torch.no_grad():
             for target_param, param in zip(self.target_net.parameters(), self.q_net.parameters()):
                 target_param.copy_(self.tau * param + (1.0 - self.tau) * target_param)
+
+        self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
+        return float(loss.item())
+
+
+class ContinuousActor(nn.Module):
+    def __init__(self, state_dim: int, simplex_dim: int, hidden_dims: Sequence[int]) -> None:
+        super().__init__()
+        trunk_out = hidden_dims[-1] if hidden_dims else 128
+        self.backbone = _mlp(state_dim, hidden_dims, trunk_out)
+        self.alpha_head = nn.Linear(trunk_out, simplex_dim)
+        self.beta_a_head = nn.Linear(trunk_out, 1)
+        self.beta_b_head = nn.Linear(trunk_out, 1)
+
+    def forward(self, states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        x = self.backbone(states)
+        alpha = torch.nn.functional.softplus(self.alpha_head(x)) + 1.05
+        beta_a = torch.nn.functional.softplus(self.beta_a_head(x)) + 1.05
+        beta_b = torch.nn.functional.softplus(self.beta_b_head(x)) + 1.05
+        return alpha, beta_a, beta_b
+
+
+def _build_action_distribution(
+    alpha: torch.Tensor,
+    beta_a: torch.Tensor,
+    beta_b: torch.Tensor,
+) -> tuple[torch.distributions.Dirichlet, torch.distributions.Beta]:
+    dirichlet = torch.distributions.Dirichlet(alpha)
+    beta = torch.distributions.Beta(beta_a.squeeze(-1), beta_b.squeeze(-1))
+    return dirichlet, beta
+
+
+def hold_from_fraction(
+    hold_fraction: float,
+    min_hold_steps: int,
+    max_hold_steps: int,
+    previous_hold: int,
+    inertia: float,
+) -> int:
+    hold_fraction = max(0.0, min(1.0, hold_fraction))
+    raw = min_hold_steps + int(round(hold_fraction * (max_hold_steps - min_hold_steps)))
+    raw = max(min_hold_steps, min(max_hold_steps, raw))
+    inertia = max(0.0, min(0.99, inertia))
+    smoothed = int(round(inertia * previous_hold + (1.0 - inertia) * raw))
+    return max(min_hold_steps, min(max_hold_steps, smoothed))
+
+
+@dataclass
+class PPORecord:
+    state: np.ndarray
+    action: np.ndarray
+    logprob: float
+    value: float
+    reward: float
+    done: bool
+
+
+class PPOContinuousPolicy:
+    """Continuous-action PPO over simplex weights and hold fraction."""
+
+    def __init__(
+        self,
+        state_dim: int,
+        simplex_dim: int,
+        hidden_dims: Sequence[int] = (128, 128),
+        learning_rate: float = 3e-4,
+        clip_ratio: float = 0.2,
+        entropy_coef: float = 1e-3,
+        gamma: float = 0.99,
+        gae_lambda: float = 0.95,
+        epochs: int = 4,
+        min_hold_steps: int = 2,
+        max_hold_steps: int = 10,
+        hold_inertia: float = 0.75,
+        seed: int = 0,
+        device: str | None = None,
+    ) -> None:
+        self.device = _to_device(device)
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
+
+        self.simplex_dim = simplex_dim
+        self.clip_ratio = clip_ratio
+        self.entropy_coef = entropy_coef
+        self.gamma = gamma
+        self.gae_lambda = gae_lambda
+        self.epochs = epochs
+        self.min_hold_steps = min_hold_steps
+        self.max_hold_steps = max_hold_steps
+        self.hold_inertia = hold_inertia
+        self._last_hold = max(min_hold_steps, int(round((min_hold_steps + max_hold_steps) / 2)))
+
+        self.actor = ContinuousActor(state_dim, simplex_dim, hidden_dims).to(self.device)
+        self.critic = _mlp(state_dim, hidden_dims, 1).to(self.device)
+        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=learning_rate)
+        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=learning_rate)
+        self.records: list[PPORecord] = []
+
+    def _distribution(self, states: torch.Tensor):
+        alpha, beta_a, beta_b = self.actor(states)
+        return _build_action_distribution(alpha, beta_a, beta_b)
+
+    def select_action(
+        self,
+        state: np.ndarray,
+        stochastic: bool = True,
+    ) -> tuple[np.ndarray, int, np.ndarray, float, float, float]:
+        with torch.no_grad():
+            state_t = torch.as_tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
+            dirichlet, beta = self._distribution(state_t)
+            if stochastic:
+                weights = dirichlet.sample()
+                hold_frac = beta.sample()
+            else:
+                weights = dirichlet.mean
+                hold_frac = beta.mean
+            logprob = dirichlet.log_prob(weights) + beta.log_prob(hold_frac)
+            entropy = dirichlet.entropy() + beta.entropy()
+            value = self.critic(state_t).squeeze(0).squeeze(0)
+
+        weights_np = weights.squeeze(0).detach().cpu().numpy().astype(np.float32)
+        hold_fraction = float(hold_frac.squeeze(0).detach().cpu().item())
+        hold_steps = hold_from_fraction(
+            hold_fraction=hold_fraction,
+            min_hold_steps=self.min_hold_steps,
+            max_hold_steps=self.max_hold_steps,
+            previous_hold=self._last_hold,
+            inertia=self.hold_inertia,
+        )
+        self._last_hold = hold_steps
+        action_vec = np.concatenate([weights_np, np.array([hold_fraction], dtype=np.float32)]).astype(np.float32)
+        return (
+            weights_np,
+            hold_steps,
+            action_vec,
+            float(logprob.item()),
+            float(value.item()),
+            float(entropy.item()),
+        )
+
+    def remember(
+        self,
+        state: Iterable[float],
+        action_vec: Iterable[float],
+        logprob: float,
+        value: float,
+        reward: float,
+        done: bool,
+    ) -> None:
+        self.records.append(
+            PPORecord(
+                state=np.asarray(list(state), dtype=np.float32),
+                action=np.asarray(list(action_vec), dtype=np.float32),
+                logprob=float(logprob),
+                value=float(value),
+                reward=float(reward),
+                done=bool(done),
+            )
+        )
+
+    def learn(self) -> float | None:
+        if not self.records:
+            return None
+
+        states = np.stack([r.state for r in self.records], axis=0)
+        actions = np.stack([r.action for r in self.records], axis=0)
+        old_logprobs = np.array([r.logprob for r in self.records], dtype=np.float32)
+        rewards = np.array([r.reward for r in self.records], dtype=np.float32)
+        values = np.array([r.value for r in self.records], dtype=np.float32)
+        dones = np.array([float(r.done) for r in self.records], dtype=np.float32)
+
+        advantages = np.zeros_like(rewards)
+        gae = 0.0
+        next_value = 0.0
+        for t in reversed(range(len(rewards))):
+            delta = rewards[t] + self.gamma * (1.0 - dones[t]) * next_value - values[t]
+            gae = delta + self.gamma * self.gae_lambda * (1.0 - dones[t]) * gae
+            advantages[t] = gae
+            next_value = values[t]
+        returns = advantages + values
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        states_t = torch.as_tensor(states, dtype=torch.float32, device=self.device)
+        actions_t = torch.as_tensor(actions, dtype=torch.float32, device=self.device)
+        old_log_t = torch.as_tensor(old_logprobs, dtype=torch.float32, device=self.device)
+        adv_t = torch.as_tensor(advantages, dtype=torch.float32, device=self.device)
+        ret_t = torch.as_tensor(returns, dtype=torch.float32, device=self.device)
+
+        losses: list[float] = []
+        for _ in range(self.epochs):
+            dirichlet, beta = self._distribution(states_t)
+            weights = actions_t[:, : self.simplex_dim]
+            hold_frac = actions_t[:, self.simplex_dim]
+            new_log = dirichlet.log_prob(weights) + beta.log_prob(hold_frac)
+            ratio = torch.exp(new_log - old_log_t)
+            clipped = torch.clamp(ratio, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio)
+            actor_loss = -torch.min(ratio * adv_t, clipped * adv_t).mean()
+            entropy = (dirichlet.entropy() + beta.entropy()).mean()
+            actor_obj = actor_loss - self.entropy_coef * entropy
+
+            values_pred = self.critic(states_t).squeeze(-1)
+            critic_loss = torch.mean((values_pred - ret_t) ** 2)
+
+            self.actor_opt.zero_grad()
+            actor_obj.backward(retain_graph=True)
+            nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=5.0)
+            self.actor_opt.step()
+
+            self.critic_opt.zero_grad()
+            critic_loss.backward()
+            nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=5.0)
+            self.critic_opt.step()
+
+            losses.append(float((actor_loss + critic_loss).item()))
+
+        self.records = []
+        return float(np.mean(losses)) if losses else None
+
+
+@dataclass(frozen=True)
+class ContinuousTransition:
+    state: np.ndarray
+    action: np.ndarray
+    reward: float
+    next_state: np.ndarray
+    done: bool
+
+
+class ContinuousReplayBuffer:
+    def __init__(self, capacity: int, seed: int = 0) -> None:
+        self._items: deque[ContinuousTransition] = deque(maxlen=capacity)
+        self._rng = random.Random(seed)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def push(self, transition: ContinuousTransition) -> None:
+        self._items.append(transition)
+
+    def sample(self, batch_size: int) -> list[ContinuousTransition]:
+        return self._rng.sample(list(self._items), batch_size)
+
+
+class QContinuous(nn.Module):
+    def __init__(self, state_dim: int, action_dim: int, hidden_dims: Sequence[int]) -> None:
+        super().__init__()
+        self.model = _mlp(state_dim + action_dim, hidden_dims, 1)
+
+    def forward(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([states, actions], dim=-1)
+        return self.model(x).squeeze(-1)
+
+
+class SACContinuousPolicy:
+    """SAC-style continuous policy over simplex weights and hold fraction."""
+
+    def __init__(
+        self,
+        state_dim: int,
+        simplex_dim: int,
+        hidden_dims: Sequence[int] = (128, 128),
+        learning_rate: float = 3e-4,
+        gamma: float = 0.99,
+        tau: float = 0.02,
+        alpha: float = 0.15,
+        batch_size: int = 64,
+        replay_size: int = 20000,
+        min_hold_steps: int = 2,
+        max_hold_steps: int = 8,
+        hold_inertia: float = 0.75,
+        seed: int = 0,
+        device: str | None = None,
+    ) -> None:
+        self.device = _to_device(device)
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
+
+        self.simplex_dim = simplex_dim
+        self.action_dim = simplex_dim + 1
+        self.gamma = gamma
+        self.tau = tau
+        self.alpha = alpha
+        self.batch_size = batch_size
+        self.min_hold_steps = min_hold_steps
+        self.max_hold_steps = max_hold_steps
+        self.hold_inertia = hold_inertia
+        self._last_hold = max(min_hold_steps, int(round((min_hold_steps + max_hold_steps) / 2)))
+
+        self.actor = ContinuousActor(state_dim, simplex_dim, hidden_dims).to(self.device)
+        self.q1 = QContinuous(state_dim, self.action_dim, hidden_dims).to(self.device)
+        self.q2 = QContinuous(state_dim, self.action_dim, hidden_dims).to(self.device)
+        self.q1_target = QContinuous(state_dim, self.action_dim, hidden_dims).to(self.device)
+        self.q2_target = QContinuous(state_dim, self.action_dim, hidden_dims).to(self.device)
+        self.q1_target.load_state_dict(self.q1.state_dict())
+        self.q2_target.load_state_dict(self.q2.state_dict())
+
+        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=learning_rate)
+        self.q1_opt = torch.optim.Adam(self.q1.parameters(), lr=learning_rate)
+        self.q2_opt = torch.optim.Adam(self.q2.parameters(), lr=learning_rate)
+        self.replay = ContinuousReplayBuffer(replay_size, seed=seed)
+
+    def _distribution(self, states: torch.Tensor):
+        alpha, beta_a, beta_b = self.actor(states)
+        return _build_action_distribution(alpha, beta_a, beta_b)
+
+    def _sample_action_batch(
+        self,
+        states: torch.Tensor,
+        stochastic: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        dirichlet, beta = self._distribution(states)
+        if stochastic:
+            weights = dirichlet.rsample()
+            hold_frac = beta.rsample()
+        else:
+            weights = dirichlet.mean
+            hold_frac = beta.mean
+        logprob = dirichlet.log_prob(weights) + beta.log_prob(hold_frac)
+        entropy = dirichlet.entropy() + beta.entropy()
+        action = torch.cat([weights, hold_frac.unsqueeze(-1)], dim=-1)
+        return action, logprob, entropy
+
+    def select_action(
+        self,
+        state: np.ndarray,
+        stochastic: bool = True,
+    ) -> tuple[np.ndarray, int, np.ndarray, float]:
+        with torch.no_grad():
+            state_t = torch.as_tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
+            action_t, _, entropy_t = self._sample_action_batch(state_t, stochastic=stochastic)
+        action_np = action_t.squeeze(0).cpu().numpy().astype(np.float32)
+        weights = action_np[: self.simplex_dim]
+        hold_frac = float(action_np[self.simplex_dim])
+        hold_steps = hold_from_fraction(
+            hold_fraction=hold_frac,
+            min_hold_steps=self.min_hold_steps,
+            max_hold_steps=self.max_hold_steps,
+            previous_hold=self._last_hold,
+            inertia=self.hold_inertia,
+        )
+        self._last_hold = hold_steps
+        uncertainty = float(max(0.0, entropy_t.squeeze(0).item()))
+        return weights, hold_steps, action_np, uncertainty
+
+    def store(
+        self,
+        state: Iterable[float],
+        action_vec: Iterable[float],
+        reward: float,
+        next_state: Iterable[float],
+        done: bool,
+    ) -> None:
+        self.replay.push(
+            ContinuousTransition(
+                state=np.asarray(list(state), dtype=np.float32),
+                action=np.asarray(list(action_vec), dtype=np.float32),
+                reward=float(reward),
+                next_state=np.asarray(list(next_state), dtype=np.float32),
+                done=bool(done),
+            )
+        )
+
+    def train_step(self) -> float | None:
+        if len(self.replay) < self.batch_size:
+            return None
+        batch = self.replay.sample(self.batch_size)
+
+        states = torch.as_tensor(np.stack([b.state for b in batch]), dtype=torch.float32, device=self.device)
+        actions = torch.as_tensor(np.stack([b.action for b in batch]), dtype=torch.float32, device=self.device)
+        rewards = torch.as_tensor([b.reward for b in batch], dtype=torch.float32, device=self.device)
+        next_states = torch.as_tensor(np.stack([b.next_state for b in batch]), dtype=torch.float32, device=self.device)
+        dones = torch.as_tensor([float(b.done) for b in batch], dtype=torch.float32, device=self.device)
+
+        with torch.no_grad():
+            next_actions, next_logprob, _ = self._sample_action_batch(next_states, stochastic=True)
+            q_next = torch.min(self.q1_target(next_states, next_actions), self.q2_target(next_states, next_actions))
+            target_q = rewards + (1.0 - dones) * self.gamma * (q_next - self.alpha * next_logprob)
+
+        q1_pred = self.q1(states, actions)
+        q2_pred = self.q2(states, actions)
+        q1_loss = torch.mean((q1_pred - target_q) ** 2)
+        q2_loss = torch.mean((q2_pred - target_q) ** 2)
+
+        self.q1_opt.zero_grad()
+        q1_loss.backward()
+        nn.utils.clip_grad_norm_(self.q1.parameters(), max_norm=5.0)
+        self.q1_opt.step()
+
+        self.q2_opt.zero_grad()
+        q2_loss.backward()
+        nn.utils.clip_grad_norm_(self.q2.parameters(), max_norm=5.0)
+        self.q2_opt.step()
+
+        actions_new, logprob_new, _ = self._sample_action_batch(states, stochastic=True)
+        q_actor = torch.min(self.q1(states, actions_new), self.q2(states, actions_new))
+        actor_loss = torch.mean(self.alpha * logprob_new - q_actor)
+
+        self.actor_opt.zero_grad()
+        actor_loss.backward()
+        nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=5.0)
+        self.actor_opt.step()
+
+        with torch.no_grad():
+            for target, source in zip(self.q1_target.parameters(), self.q1.parameters()):
+                target.copy_(self.tau * source + (1.0 - self.tau) * target)
+            for target, source in zip(self.q2_target.parameters(), self.q2.parameters()):
+                target.copy_(self.tau * source + (1.0 - self.tau) * target)
+
+        return float((q1_loss + q2_loss + actor_loss).item())
 

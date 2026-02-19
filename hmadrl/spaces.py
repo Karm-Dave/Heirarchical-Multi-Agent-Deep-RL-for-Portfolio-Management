@@ -29,6 +29,7 @@ class TopLevelState:
     remaining_horizon_steps: int
     step_index: int
     cash_ratio: float
+    global_features: Mapping[str, float] | None = None
 
     def to_vector(self, domain_names: Sequence[str]) -> list[float]:
         out: list[float] = []
@@ -48,11 +49,14 @@ class TopLevelState:
                 float(self.cash_ratio),
             ]
         )
+        if self.global_features:
+            for key in sorted(self.global_features.keys()):
+                out.append(float(self.global_features[key]))
         return out
 
     @staticmethod
-    def vector_size(num_domains: int) -> int:
-        return 4 * num_domains + 3
+    def vector_size(num_domains: int, num_global_features: int = 0) -> int:
+        return 4 * num_domains + 3 + num_global_features
 
 
 @dataclass(frozen=True)
@@ -62,12 +66,14 @@ class TopLevelAction:
     domain_weights: Mapping[str, float]
     hold_steps: int
     action_id: str
+    uncertainty: float = 0.0
 
     def normalized(self) -> "TopLevelAction":
         return TopLevelAction(
             domain_weights=_normalize(self.domain_weights),
             hold_steps=max(1, int(self.hold_steps)),
             action_id=self.action_id,
+            uncertainty=float(max(0.0, self.uncertainty)),
         )
 
 
@@ -82,6 +88,7 @@ class DomainState:
     current_stock_allocation: Mapping[str, float]
     remaining_domain_steps: int
     step_index: int
+    domain_factors: Mapping[str, float] | None = None
 
     def to_vector(self, stock_names: Sequence[str]) -> list[float]:
         out: list[float] = []
@@ -95,11 +102,14 @@ class DomainState:
                 ]
             )
         out.extend([float(self.remaining_domain_steps), float(self.step_index)])
+        if self.domain_factors:
+            for key in sorted(self.domain_factors.keys()):
+                out.append(float(self.domain_factors[key]))
         return out
 
     @staticmethod
-    def vector_size(num_stocks: int) -> int:
-        return 4 * num_stocks + 2
+    def vector_size(num_stocks: int, num_domain_factors: int = 0) -> int:
+        return 4 * num_stocks + 2 + num_domain_factors
 
 
 @dataclass(frozen=True)
@@ -109,12 +119,14 @@ class DomainAction:
     stock_weights: Mapping[str, float]
     hold_steps: int
     action_id: str
+    uncertainty: float = 0.0
 
     def normalized(self) -> "DomainAction":
         return DomainAction(
             stock_weights=_normalize(self.stock_weights),
             hold_steps=max(1, int(self.hold_steps)),
             action_id=self.action_id,
+            uncertainty=float(max(0.0, self.uncertainty)),
         )
 
 

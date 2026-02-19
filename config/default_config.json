@@ -9,33 +9,76 @@
     "consumer": ["AMZN", "WMT", "COST", "KO", "PG"]
   },
   "rl": {
-    "max_domain_hold_steps": 8,
-    "max_stock_hold_steps": 5,
+    "top_algorithm": "ppo",
+    "domain_algorithm": "sac",
+    "max_domain_hold_steps": 12,
+    "max_stock_hold_steps": 8,
+    "min_domain_hold_steps": 2,
+    "min_stock_hold_steps": 2,
     "random_seed": 42,
-    "training_steps": 80,
-    "stochastic_actions": true
+    "training_steps": 0,
+    "stochastic_actions": true,
+    "ensemble_size": 3,
+    "hidden_dims": [128, 128],
+    "ppo_epochs": 4,
+    "ppo_clip": 0.2,
+    "ppo_lr": 0.0003,
+    "ppo_entropy_coef": 0.001,
+    "sac_lr": 0.0003,
+    "sac_gamma": 0.99,
+    "sac_alpha": 0.15,
+    "sac_batch_size": 64,
+    "sac_replay_size": 20000
   },
   "data": {
-    "start_date": "2023-01-01",
+    "start_date": "2018-01-01",
     "end_date": "2025-12-31",
     "interval": "1d",
     "provider": "auto",
-    "lookback": 20,
+    "lookback": 30,
     "train_split": 0.7,
-    "cache_dir": "data_cache"
+    "cache_dir": "data_cache",
+    "walk_forward_train": 220,
+    "walk_forward_test": 80,
+    "walk_forward_step": 80,
+    "market_symbol": "SPY",
+    "rate_symbols": ["TLT", "SHY"],
+    "volatility_symbol": "VXX",
+    "cross_asset_symbols": ["GLD", "USO", "UUP"],
+    "sector_etfs": {
+      "technology": "XLK",
+      "finance": "XLF",
+      "healthcare": "XLV",
+      "energy": "XLE",
+      "industrials": "XLI",
+      "consumer": "XLP"
+    }
+  },
+  "reward": {
+    "transaction_cost_bps": 5.0,
+    "slippage_bps": 2.5,
+    "turnover_penalty": 0.0015,
+    "downside_penalty": 2.0,
+    "cvar_alpha": 0.1,
+    "cvar_penalty": 1.5,
+    "reward_window": 60
   },
   "stochastic_control": {
     "risk_aversion": 3.0,
-    "hold_scale": 1.1,
+    "hold_scale": 1.2,
     "uncertainty_penalty": 0.35,
     "mean_reversion_speed": 0.18,
-    "max_single_stock_weight": 0.45,
-    "min_domain_allocation": 0.01
+    "max_single_stock_weight": 0.4,
+    "min_domain_allocation": 0.01,
+    "min_hold_ratio": 0.25,
+    "hold_inertia": 0.75
   },
   "experiments": {
     "results_dir": "results",
-    "run_name": "hmadrl_batch",
+    "run_name": "hmadrl_continuous_batch",
     "modes": ["rl", "moe_router"],
-    "seeds": [42, 84]
+    "seeds": [42, 84, 126],
+    "fine_tune_rounds": 2
   }
 }
+
