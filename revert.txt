@@ -1,0 +1,24 @@
+git switch -c snapshot-9da16b0 9da16b0
+
+
+git switch master
+git reset --hard 9da16b0
+
+# Option 1: safest (new branch at that commit)
+git switch -c restore_55725bc 55725bc
+
+# Option 3: force current branch back to that commit
+git switch master
+git reset --hard 55725bc
+
+
+
+new
+Commands to revert to this exact working commit (do not run unless you want to revert):
+
+git switch master
+git reset --hard 7c02873
+Non-destructive way to inspect that version:
+
+git switch --detach 7c02873
+

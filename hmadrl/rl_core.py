@@ -28,6 +28,23 @@ def _mlp(
     return nn.Sequential(*layers)
 
 
+def _mlp_layernorm(
+    in_dim: int,
+    hidden_dims: Sequence[int],
+    out_dim: int,
+    activation: type[nn.Module] = nn.ReLU,
+) -> nn.Sequential:
+    layers: list[nn.Module] = []
+    prev = in_dim
+    for hidden in hidden_dims:
+        layers.append(nn.Linear(prev, hidden))
+        layers.append(nn.LayerNorm(hidden))
+        layers.append(activation())
+        prev = hidden
+    layers.append(nn.Linear(prev, out_dim))
+    return nn.Sequential(*layers)
+
+
 def _to_device(device: str | None) -> torch.device:
     return torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
@@ -198,6 +215,94 @@ class ContinuousActor(nn.Module):
         return alpha, beta_a, beta_b
 
 
+class TransformerBackbone(nn.Module):
+    def __init__(
+        self,
+        state_dim: int,
+        d_model: int = 96,
+        nhead: int = 4,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.state_dim = max(1, int(state_dim))
+        self.input_proj = nn.Linear(1, d_model)
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.state_dim, d_model))
+        encoder = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=max(1, int(nhead)),
+            dim_feedforward=max(2 * d_model, 128),
+            dropout=float(max(0.0, min(0.5, dropout))),
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer=encoder, num_layers=max(1, int(num_layers)))
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, states: torch.Tensor) -> torch.Tensor:
+        x = states.unsqueeze(-1)
+        x = self.input_proj(x)
+        x = x + self.pos_embed[:, : x.shape[1], :]
+        x = self.encoder(x)
+        x = self.norm(x)
+        return x.mean(dim=1)
+
+
+class TransformerContinuousActor(nn.Module):
+    def __init__(
+        self,
+        state_dim: int,
+        simplex_dim: int,
+        d_model: int = 96,
+        nhead: int = 4,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.backbone = TransformerBackbone(
+            state_dim=state_dim,
+            d_model=d_model,
+            nhead=nhead,
+            num_layers=num_layers,
+            dropout=dropout,
+        )
+        self.alpha_head = nn.Linear(d_model, simplex_dim)
+        self.beta_a_head = nn.Linear(d_model, 1)
+        self.beta_b_head = nn.Linear(d_model, 1)
+
+    def forward(self, states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        x = self.backbone(states)
+        alpha = torch.nn.functional.softplus(self.alpha_head(x)) + 1.05
+        beta_a = torch.nn.functional.softplus(self.beta_a_head(x)) + 1.05
+        beta_b = torch.nn.functional.softplus(self.beta_b_head(x)) + 1.05
+        return alpha, beta_a, beta_b
+
+
+class TransformerCritic(nn.Module):
+    def __init__(
+        self,
+        state_dim: int,
+        d_model: int = 96,
+        nhead: int = 4,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.backbone = TransformerBackbone(
+            state_dim=state_dim,
+            d_model=d_model,
+            nhead=nhead,
+            num_layers=num_layers,
+            dropout=dropout,
+        )
+        self.head = nn.Linear(d_model, 1)
+
+    def forward(self, states: torch.Tensor) -> torch.Tensor:
+        x = self.backbone(states)
+        return self.head(x)
+
+
 def _build_action_distribution(
     alpha: torch.Tensor,
     beta_a: torch.Tensor,
@@ -247,6 +352,11 @@ class PPOContinuousPolicy:
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
         epochs: int = 4,
+        network_type: str = "mlp",
+        transformer_d_model: int = 96,
+        transformer_nhead: int = 4,
+        transformer_layers: int = 2,
+        transformer_dropout: float = 0.1,
         min_hold_steps: int = 2,
         max_hold_steps: int = 10,
         hold_inertia: float = 0.75,
@@ -268,9 +378,26 @@ class PPOContinuousPolicy:
         self.max_hold_steps = max_hold_steps
         self.hold_inertia = hold_inertia
         self._last_hold = max(min_hold_steps, int(round((min_hold_steps + max_hold_steps) / 2)))
-
-        self.actor = ContinuousActor(state_dim, simplex_dim, hidden_dims).to(self.device)
-        self.critic = _mlp(state_dim, hidden_dims, 1).to(self.device)
+        network_type = str(network_type).lower()
+        if network_type == "transformer":
+            self.actor = TransformerContinuousActor(
+                state_dim=state_dim,
+                simplex_dim=simplex_dim,
+                d_model=transformer_d_model,
+                nhead=transformer_nhead,
+                num_layers=transformer_layers,
+                dropout=transformer_dropout,
+            ).to(self.device)
+            self.critic = TransformerCritic(
+                state_dim=state_dim,
+                d_model=transformer_d_model,
+                nhead=transformer_nhead,
+                num_layers=transformer_layers,
+                dropout=transformer_dropout,
+            ).to(self.device)
+        else:
+            self.actor = ContinuousActor(state_dim, simplex_dim, hidden_dims).to(self.device)
+            self.critic = _mlp(state_dim, hidden_dims, 1).to(self.device)
         self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=learning_rate)
         self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=learning_rate)
         self.records: list[PPORecord] = []
@@ -430,6 +557,21 @@ class QContinuous(nn.Module):
         return self.model(x).squeeze(-1)
 
 
+class DuelingQContinuous(nn.Module):
+    def __init__(self, state_dim: int, action_dim: int, hidden_dims: Sequence[int]) -> None:
+        super().__init__()
+        self.state_net = _mlp_layernorm(state_dim, hidden_dims, hidden_dims[-1] if hidden_dims else 128)
+        trunk_out = hidden_dims[-1] if hidden_dims else 128
+        self.adv_net = _mlp_layernorm(trunk_out + action_dim, hidden_dims, 1)
+        self.val_net = _mlp_layernorm(trunk_out, hidden_dims, 1)
+
+    def forward(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        s = self.state_net(states)
+        adv = self.adv_net(torch.cat([s, actions], dim=-1)).squeeze(-1)
+        val = self.val_net(s).squeeze(-1)
+        return val + adv
+
+
 class SACContinuousPolicy:
     """SAC-style continuous policy over simplex weights and hold fraction."""
 
@@ -442,6 +584,9 @@ class SACContinuousPolicy:
         gamma: float = 0.99,
         tau: float = 0.02,
         alpha: float = 0.15,
+        auto_alpha: bool = False,
+        target_entropy: float | None = None,
+        use_dueling_critic: bool = True,
         batch_size: int = 64,
         replay_size: int = 20000,
         min_hold_steps: int = 2,
@@ -460,6 +605,7 @@ class SACContinuousPolicy:
         self.gamma = gamma
         self.tau = tau
         self.alpha = alpha
+        self.auto_alpha = bool(auto_alpha)
         self.batch_size = batch_size
         self.min_hold_steps = min_hold_steps
         self.max_hold_steps = max_hold_steps
@@ -467,16 +613,29 @@ class SACContinuousPolicy:
         self._last_hold = max(min_hold_steps, int(round((min_hold_steps + max_hold_steps) / 2)))
 
         self.actor = ContinuousActor(state_dim, simplex_dim, hidden_dims).to(self.device)
-        self.q1 = QContinuous(state_dim, self.action_dim, hidden_dims).to(self.device)
-        self.q2 = QContinuous(state_dim, self.action_dim, hidden_dims).to(self.device)
-        self.q1_target = QContinuous(state_dim, self.action_dim, hidden_dims).to(self.device)
-        self.q2_target = QContinuous(state_dim, self.action_dim, hidden_dims).to(self.device)
+        critic_cls: type[nn.Module] = DuelingQContinuous if use_dueling_critic else QContinuous
+        self.q1 = critic_cls(state_dim, self.action_dim, hidden_dims).to(self.device)
+        self.q2 = critic_cls(state_dim, self.action_dim, hidden_dims).to(self.device)
+        self.q1_target = critic_cls(state_dim, self.action_dim, hidden_dims).to(self.device)
+        self.q2_target = critic_cls(state_dim, self.action_dim, hidden_dims).to(self.device)
         self.q1_target.load_state_dict(self.q1.state_dict())
         self.q2_target.load_state_dict(self.q2.state_dict())
 
         self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=learning_rate)
         self.q1_opt = torch.optim.Adam(self.q1.parameters(), lr=learning_rate)
         self.q2_opt = torch.optim.Adam(self.q2.parameters(), lr=learning_rate)
+        if self.auto_alpha:
+            init_log_alpha = float(np.log(max(1e-4, alpha)))
+            self.log_alpha = torch.tensor(init_log_alpha, dtype=torch.float32, device=self.device, requires_grad=True)
+            self.alpha_opt = torch.optim.Adam([self.log_alpha], lr=learning_rate)
+            self.target_entropy = float(
+                target_entropy if target_entropy is not None else -float(self.action_dim)
+            )
+            self.alpha = float(np.exp(init_log_alpha))
+        else:
+            self.log_alpha = None
+            self.alpha_opt = None
+            self.target_entropy = float(target_entropy if target_entropy is not None else -float(self.action_dim))
         self.replay = ContinuousReplayBuffer(replay_size, seed=seed)
 
     def _distribution(self, states: torch.Tensor):
@@ -580,11 +739,20 @@ class SACContinuousPolicy:
         nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=5.0)
         self.actor_opt.step()
 
+        alpha_loss_value = 0.0
+        if self.auto_alpha and self.log_alpha is not None and self.alpha_opt is not None:
+            alpha_loss = -(self.log_alpha * (logprob_new + self.target_entropy).detach()).mean()
+            self.alpha_opt.zero_grad()
+            alpha_loss.backward()
+            self.alpha_opt.step()
+            with torch.no_grad():
+                self.alpha = float(self.log_alpha.exp().item())
+            alpha_loss_value = float(alpha_loss.item())
+
         with torch.no_grad():
             for target, source in zip(self.q1_target.parameters(), self.q1.parameters()):
                 target.copy_(self.tau * source + (1.0 - self.tau) * target)
             for target, source in zip(self.q2_target.parameters(), self.q2.parameters()):
                 target.copy_(self.tau * source + (1.0 - self.tau) * target)
 
-        return float((q1_loss + q2_loss + actor_loss).item())
-
+        return float((q1_loss + q2_loss + actor_loss).item() + alpha_loss_value)

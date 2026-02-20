@@ -89,9 +89,20 @@ class DomainState:
     remaining_domain_steps: int
     step_index: int
     domain_factors: Mapping[str, float] | None = None
+    stock_features: Mapping[str, Mapping[str, float]] | None = None
 
-    def to_vector(self, stock_names: Sequence[str]) -> list[float]:
+    def to_vector(
+        self,
+        stock_names: Sequence[str],
+        stock_feature_names: Sequence[str] | None = None,
+    ) -> list[float]:
         out: list[float] = []
+        feature_names = list(stock_feature_names or [])
+        if not feature_names and self.stock_features:
+            keys = set()
+            for values in self.stock_features.values():
+                keys.update(values.keys())
+            feature_names = sorted(keys)
         for stock in stock_names:
             out.extend(
                 [
@@ -101,6 +112,10 @@ class DomainState:
                     float(self.current_stock_allocation.get(stock, 0.0)),
                 ]
             )
+            if feature_names:
+                features = (self.stock_features or {}).get(stock, {})
+                for key in feature_names:
+                    out.append(float(features.get(key, 0.0)))
         out.extend([float(self.remaining_domain_steps), float(self.step_index)])
         if self.domain_factors:
             for key in sorted(self.domain_factors.keys()):
@@ -108,8 +123,12 @@ class DomainState:
         return out
 
     @staticmethod
-    def vector_size(num_stocks: int, num_domain_factors: int = 0) -> int:
-        return 4 * num_stocks + 2 + num_domain_factors
+    def vector_size(
+        num_stocks: int,
+        num_domain_factors: int = 0,
+        num_stock_features: int = 0,
+    ) -> int:
+        return (4 + num_stock_features) * num_stocks + 2 + num_domain_factors
 
 
 @dataclass(frozen=True)

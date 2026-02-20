@@ -61,12 +61,18 @@ class DomainRLManager:
         stock_names: Sequence[str],
         max_hold_steps: int,
         num_domain_factors: int = 0,
+        num_stock_features: int = 0,
+        stock_feature_names: Sequence[str] | None = None,
         min_hold_steps: int = 2,
         hidden_dims: Sequence[int] = (128, 128),
         ensemble_size: int = 1,
         learning_rate: float = 3e-4,
         gamma: float = 0.99,
+        tau: float = 0.005,
         alpha: float = 0.15,
+        auto_alpha: bool = True,
+        target_entropy: float = -2.0,
+        use_dueling_critic: bool = True,
         batch_size: int = 64,
         replay_size: int = 20000,
         hold_inertia: float = 0.75,
@@ -74,9 +80,11 @@ class DomainRLManager:
     ) -> None:
         self.domain_name = domain_name
         self.stock_names = list(stock_names)
+        self.stock_feature_names = list(stock_feature_names or [])
         self._state_dim = DomainState.vector_size(
             len(self.stock_names),
             num_domain_factors=num_domain_factors,
+            num_stock_features=num_stock_features,
         )
         self._ensemble_size = max(1, int(ensemble_size))
         self.policies = [
@@ -86,7 +94,11 @@ class DomainRLManager:
                 hidden_dims=hidden_dims,
                 learning_rate=learning_rate,
                 gamma=gamma,
+                tau=tau,
                 alpha=alpha,
+                auto_alpha=auto_alpha,
+                target_entropy=target_entropy,
+                use_dueling_critic=use_dueling_critic,
                 batch_size=batch_size,
                 replay_size=replay_size,
                 min_hold_steps=min_hold_steps,
@@ -99,7 +111,13 @@ class DomainRLManager:
         self._last_action_vecs: list[np.ndarray] = []
 
     def _extend_state(self, state: DomainState) -> np.ndarray:
-        vector = np.asarray(state.to_vector(self.stock_names), dtype=np.float32)
+        vector = np.asarray(
+            state.to_vector(
+                self.stock_names,
+                stock_feature_names=self.stock_feature_names,
+            ),
+            dtype=np.float32,
+        )
         if vector.shape[0] < self._state_dim:
             padded = np.zeros(self._state_dim, dtype=np.float32)
             padded[: vector.shape[0]] = vector

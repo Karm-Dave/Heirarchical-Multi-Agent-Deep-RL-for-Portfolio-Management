@@ -53,11 +53,16 @@ class StochasticController:
         domain_names: Sequence[str],
         config: StochasticControlConfig,
         max_hold_steps: int,
+        domain_stock_count: Mapping[str, int] | None = None,
         seed: int = 0,
     ) -> None:
         self.domain_names = list(domain_names)
         self.config = config
         self.max_hold_steps = max(1, int(max_hold_steps))
+        self.domain_stock_count = {
+            str(k): max(1, int(v))
+            for k, v in dict(domain_stock_count or {}).items()
+        }
         self.rng = random.Random(seed)
         self._latent_state = {domain: 0.0 for domain in self.domain_names}
         mid_hold = max(1, int(round(self.max_hold_steps * 0.5)))
@@ -89,6 +94,13 @@ class StochasticController:
             liq = float(max(0.0, state.domain_liquidity.get(domain, 0.0)))
             prev_alloc = float(max(0.0, state.current_allocation.get(domain, 0.0)))
             action_uncertainty = float(max(0.0, top_action.uncertainty))
+            global_features = state.global_features or {}
+            market_vol = float(max(0.0, global_features.get("market_vol", 0.0)))
+            market_dd = float(abs(min(0.0, global_features.get("market_drawdown", 0.0))))
+            bear_flag = float(max(0.0, global_features.get("regime_bear", 0.0)))
+            vol_flag = float(max(0.0, global_features.get("regime_volatile", 0.0)))
+            market_stress = min(3.0, market_vol + 2.0 * market_dd + bear_flag + 0.5 * vol_flag)
+            stress_scale = 1.0 / (1.0 + market_stress)
 
             # Merton fraction proxy for risky allocation intensity.
             merton = mu / (max(1e-4, self.config.risk_aversion) * sigma * sigma)
@@ -98,6 +110,7 @@ class StochasticController:
                 + self.config.uncertainty_penalty * abs(mu - momentum_mean)
                 + 1.0 / (1.0 + liq)
                 + 0.25 * action_uncertainty
+                + 0.5 * market_stress
             )
 
             latent_prev = self._latent_state.get(domain, 0.0)
@@ -111,10 +124,13 @@ class StochasticController:
 
             confidence = 1.0 / (1.0 + uncertainty)
             control_term = 0.5 * math.tanh(latent_new) + 0.5 * confidence
-            budget_score = base_budgets[domain] * (0.6 + 0.4 * control_term) + 0.1 * prev_alloc
+            budget_score = (
+                base_budgets[domain] * (0.6 + 0.4 * control_term) * (0.65 + 0.35 * stress_scale)
+                + 0.1 * prev_alloc
+            )
             budget_score = max(0.0, budget_score)
 
-            risk_score = 1.0 / sigma
+            risk_score = (1.0 / sigma) * (0.5 + 0.5 * stress_scale)
             hold_score = math.exp(
                 self.config.hold_scale
                 * ((mu / sigma) - self.config.uncertainty_penalty * uncertainty)
@@ -130,8 +146,9 @@ class StochasticController:
             hold_steps = max(local_min_hold, min(local_max_hold, hold_steps))
             self._last_hold[domain] = hold_steps
 
-            max_stock_weight = self.config.max_single_stock_weight * (0.75 + 0.25 * confidence)
-            max_stock_weight = float(min(0.95, max(0.1, max_stock_weight)))
+            max_stock_weight = self.config.max_single_stock_weight * (0.65 + 0.35 * confidence) * (0.7 + 0.3 * stress_scale)
+            min_feasible = 1.0 / float(self.domain_stock_count.get(domain, 2))
+            max_stock_weight = float(min(0.95, max(min_feasible, max_stock_weight)))
 
             raw_budgets[domain] = budget_score
             raw_risk[domain] = risk_score

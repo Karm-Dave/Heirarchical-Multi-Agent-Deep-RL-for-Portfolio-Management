@@ -12,6 +12,7 @@ from typing import Any
 class RLConfig:
     top_algorithm: str
     domain_algorithm: str
+    top_network_type: str
     max_domain_hold_steps: int
     max_stock_hold_steps: int
     min_domain_hold_steps: int
@@ -24,10 +25,20 @@ class RLConfig:
     ppo_epochs: int
     ppo_clip: float
     ppo_lr: float
+    ppo_gamma: float
+    ppo_gae_lambda: float
     ppo_entropy_coef: float
+    transformer_d_model: int
+    transformer_nhead: int
+    transformer_layers: int
+    transformer_dropout: float
     sac_lr: float
     sac_gamma: float
+    sac_tau: float
     sac_alpha: float
+    sac_auto_alpha: bool
+    sac_target_entropy: float
+    sac_use_dueling: bool
     sac_batch_size: int
     sac_replay_size: int
 
@@ -49,6 +60,8 @@ class DataConfig:
     volatility_symbol: str
     cross_asset_symbols: list[str]
     sector_etfs: dict[str, str]
+    use_learned_clusters: bool
+    learned_cluster_count: int
 
 
 @dataclass(frozen=True)
@@ -140,6 +153,7 @@ def load_config(path: str | Path) -> ProjectConfig:
         rl=RLConfig(
             top_algorithm=str(rl_raw.get("top_algorithm", "ppo")).lower(),
             domain_algorithm=str(rl_raw.get("domain_algorithm", "sac")).lower(),
+            top_network_type=str(rl_raw.get("top_network_type", "mlp")).lower(),
             max_domain_hold_steps=int(rl_raw["max_domain_hold_steps"]),
             max_stock_hold_steps=int(rl_raw["max_stock_hold_steps"]),
             min_domain_hold_steps=int(rl_raw.get("min_domain_hold_steps", 2)),
@@ -152,10 +166,20 @@ def load_config(path: str | Path) -> ProjectConfig:
             ppo_epochs=max(1, int(rl_raw.get("ppo_epochs", 4))),
             ppo_clip=float(rl_raw.get("ppo_clip", 0.2)),
             ppo_lr=float(rl_raw.get("ppo_lr", 3e-4)),
+            ppo_gamma=float(rl_raw.get("ppo_gamma", 0.995)),
+            ppo_gae_lambda=float(rl_raw.get("ppo_gae_lambda", 0.95)),
             ppo_entropy_coef=float(rl_raw.get("ppo_entropy_coef", 1e-3)),
+            transformer_d_model=max(32, int(rl_raw.get("transformer_d_model", 96))),
+            transformer_nhead=max(1, int(rl_raw.get("transformer_nhead", 4))),
+            transformer_layers=max(1, int(rl_raw.get("transformer_layers", 2))),
+            transformer_dropout=float(rl_raw.get("transformer_dropout", 0.1)),
             sac_lr=float(rl_raw.get("sac_lr", 3e-4)),
-            sac_gamma=float(rl_raw.get("sac_gamma", 0.99)),
+            sac_gamma=float(rl_raw.get("sac_gamma", 0.995)),
+            sac_tau=float(rl_raw.get("sac_tau", 0.005)),
             sac_alpha=float(rl_raw.get("sac_alpha", 0.15)),
+            sac_auto_alpha=bool(rl_raw.get("sac_auto_alpha", True)),
+            sac_target_entropy=float(rl_raw.get("sac_target_entropy", -2.0)),
+            sac_use_dueling=bool(rl_raw.get("sac_use_dueling", True)),
             sac_batch_size=max(8, int(rl_raw.get("sac_batch_size", 64))),
             sac_replay_size=max(256, int(rl_raw.get("sac_replay_size", 20000))),
         ),
@@ -190,6 +214,8 @@ def load_config(path: str | Path) -> ProjectConfig:
                     )
                 ).items()
             },
+            use_learned_clusters=bool(data_raw.get("use_learned_clusters", True)),
+            learned_cluster_count=max(1, int(data_raw.get("learned_cluster_count", len(raw["domain_to_stocks"])))),
         ),
         reward=RewardConfig(
             transaction_cost_bps=float(reward_raw.get("transaction_cost_bps", 5.0)),

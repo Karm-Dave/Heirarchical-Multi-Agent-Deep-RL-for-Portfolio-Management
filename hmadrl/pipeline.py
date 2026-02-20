@@ -67,9 +67,12 @@ class BatchResult:
 
 @dataclass(frozen=True)
 class PreparedData:
+    domain_to_stocks: dict[str, list[str]]
     momentum_df: pd.DataFrame
     volatility_df: pd.DataFrame
     liquidity_df: pd.DataFrame
+    stock_feature_frames: dict[str, pd.DataFrame]
+    stock_feature_names: list[str]
     next_returns_df: pd.DataFrame
     global_feature_df: pd.DataFrame
     domain_factor_frames: dict[str, pd.DataFrame]
@@ -95,14 +98,19 @@ def _choose_provider(config: ProjectConfig):
     )
 
 
-def _extract_close_and_volume(frame: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+def _extract_ohlcv(frame: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
     price_col = "Adj Close" if "Adj Close" in frame.columns else "Close"
     close = frame[price_col].astype(float)
     volume = frame["Volume"].astype(float) if "Volume" in frame.columns else pd.Series(0.0, index=frame.index)
-    return close, volume
+    high = frame["High"].astype(float) if "High" in frame.columns else close
+    low = frame["Low"].astype(float) if "Low" in frame.columns else close
+    return close, volume, high, low
 
 
-def _build_market_frames(config: ProjectConfig, provider: Any) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def _build_market_frames(
+    config: ProjectConfig,
+    provider: Any,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     stock_symbols = sorted({s for stocks in config.domain_to_stocks.values() for s in stocks})
     factors = [config.data.market_symbol, config.data.volatility_symbol]
     factors += list(config.data.rate_symbols) + list(config.data.cross_asset_symbols) + list(config.data.sector_etfs.values())
@@ -110,20 +118,24 @@ def _build_market_frames(config: ProjectConfig, provider: Any) -> tuple[pd.DataF
 
     closes: dict[str, pd.Series] = {}
     volumes: dict[str, pd.Series] = {}
+    spreads: dict[str, pd.Series] = {}
     for symbol in stock_symbols:
         frame = provider.fetch(symbol=symbol, start_date=config.data.start_date, end_date=config.data.end_date, interval=config.data.interval)
-        close, volume = _extract_close_and_volume(frame)
+        close, volume, high, low = _extract_ohlcv(frame)
         closes[symbol] = close.rename(symbol)
         volumes[symbol] = volume.rename(symbol)
+        spread_proxy = ((high - low) / close.replace(0.0, np.nan)).replace([np.inf, -np.inf], np.nan)
+        spreads[symbol] = spread_proxy.rename(symbol)
 
     close_df = pd.concat(closes.values(), axis=1).sort_index().ffill().dropna()
     volume_df = pd.concat(volumes.values(), axis=1).sort_index().ffill().reindex(close_df.index).fillna(0.0)
+    spread_df = pd.concat(spreads.values(), axis=1).sort_index().ffill().reindex(close_df.index).fillna(0.0)
 
     factor_closes: dict[str, pd.Series] = {}
     for symbol in factors:
         try:
             frame = provider.fetch(symbol=symbol, start_date=config.data.start_date, end_date=config.data.end_date, interval=config.data.interval)
-            close, _ = _extract_close_and_volume(frame)
+            close, _, _, _ = _extract_ohlcv(frame)
             factor_closes[symbol] = close.rename(symbol)
         except Exception:
             continue
@@ -134,7 +146,7 @@ def _build_market_frames(config: ProjectConfig, provider: Any) -> tuple[pd.DataF
     for symbol in factors:
         if symbol not in factor_df.columns:
             factor_df[symbol] = fallback
-    return close_df, volume_df, factor_df.sort_index(axis=1)
+    return close_df, volume_df, factor_df.sort_index(axis=1), spread_df
 
 
 def _rolling_z(series: pd.Series, lookback: int) -> pd.Series:
@@ -160,18 +172,129 @@ def _classify_regime(ret: pd.Series, vol: pd.Series) -> pd.Series:
     return labels
 
 
+def _learned_cluster_map(
+    domain_to_stocks: Mapping[str, list[str]],
+    returns_df: pd.DataFrame,
+    cluster_count: int,
+) -> dict[str, list[str]]:
+    stocks = sorted({s for symbols in domain_to_stocks.values() for s in symbols})
+    if not stocks:
+        return {}
+    if len(stocks) <= 2:
+        return {"cluster_00": stocks}
+
+    k = max(1, min(int(cluster_count), len(stocks)))
+    corr = returns_df[stocks].corr().fillna(0.0)
+    dist = 1.0 - corr
+    variances = returns_df[stocks].var().fillna(0.0)
+    first_seed = str(variances.sort_values(ascending=False).index[0])
+    seeds = [first_seed]
+    while len(seeds) < k:
+        best_stock = None
+        best_score = -1.0
+        for stock in stocks:
+            if stock in seeds:
+                continue
+            nearest_seed = min(float(dist.loc[stock, seed]) for seed in seeds)
+            if nearest_seed > best_score:
+                best_score = nearest_seed
+                best_stock = stock
+        if best_stock is None:
+            break
+        seeds.append(str(best_stock))
+
+    cluster_assignments: dict[str, list[str]] = {f"cluster_{i:02d}": [] for i in range(len(seeds))}
+    for stock in stocks:
+        best_cluster = 0
+        best_dist = float("inf")
+        for idx, seed in enumerate(seeds):
+            d = float(dist.loc[stock, seed])
+            if d < best_dist:
+                best_dist = d
+                best_cluster = idx
+        cluster_assignments[f"cluster_{best_cluster:02d}"].append(stock)
+
+    # Ensure each cluster has at least one stock.
+    empty = [name for name, symbols in cluster_assignments.items() if not symbols]
+    if empty:
+        donors = sorted(cluster_assignments.items(), key=lambda x: len(x[1]), reverse=True)
+        for target in empty:
+            for donor_name, donor_symbols in donors:
+                if len(donor_symbols) > 1:
+                    cluster_assignments[target].append(donor_symbols.pop())
+                    break
+
+    # Drop any empty clusters that still remain.
+    return {name: symbols for name, symbols in cluster_assignments.items() if symbols}
+
+
 def _build_features(
     config: ProjectConfig,
+    domain_to_stocks: Mapping[str, list[str]],
     close_df: pd.DataFrame,
     volume_df: pd.DataFrame,
+    spread_df: pd.DataFrame,
     factor_df: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, pd.DataFrame], pd.Series]:
+) -> tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    dict[str, pd.DataFrame],
+    list[str],
+    pd.DataFrame,
+    pd.DataFrame,
+    dict[str, pd.DataFrame],
+    pd.Series,
+]:
     lb = max(2, config.data.lookback)
     ret = close_df.pct_change().replace([np.inf, -np.inf], np.nan)
-    momentum = close_df.pct_change(lb).replace([np.inf, -np.inf], np.nan)
-    volatility = (ret.rolling(lb).std() * np.sqrt(252.0)).replace([np.inf, -np.inf], np.nan)
-    liquidity = np.log1p(volume_df.rolling(lb).mean()).replace([np.inf, -np.inf], np.nan)
     next_ret = ret.shift(-1)
+
+    momentum_horizons = [5, 20, 60, 120, 252]
+    volatility_horizons = [10, 30, 90, 252]
+    momentum_map = {
+        h: close_df.pct_change(h).replace([np.inf, -np.inf], np.nan)
+        for h in momentum_horizons
+    }
+    vol_map = {
+        h: (ret.rolling(h).std() * np.sqrt(252.0)).replace([np.inf, -np.inf], np.nan)
+        for h in volatility_horizons
+    }
+
+    vol_30 = vol_map[30]
+    vol_of_vol_30 = vol_30.rolling(30).std().replace([np.inf, -np.inf], np.nan)
+    vol_10 = vol_map[10]
+    vol_90 = vol_map[90]
+    vol_252 = vol_map[252]
+    momentum = (
+        0.15 * momentum_map[5]
+        + 0.30 * momentum_map[20]
+        + 0.30 * momentum_map[60]
+        + 0.15 * momentum_map[120]
+        + 0.10 * momentum_map[252]
+    ).replace([np.inf, -np.inf], np.nan)
+    volatility = (
+        0.20 * vol_10 + 0.35 * vol_30 + 0.30 * vol_90 + 0.15 * vol_252
+    ).replace([np.inf, -np.inf], np.nan)
+
+    vol_mean_30 = volume_df.rolling(30).mean()
+    vol_std_20 = volume_df.rolling(20).std().replace(0.0, np.nan)
+    volume_z_20 = ((volume_df - volume_df.rolling(20).mean()) / vol_std_20).replace([np.inf, -np.inf], np.nan)
+    turnover_ratio_30 = (volume_df / vol_mean_30).replace([np.inf, -np.inf], np.nan)
+    amihud_20 = (
+        ret.abs() / (volume_df * close_df).replace(0.0, np.nan)
+    ).rolling(20).mean().replace([np.inf, -np.inf], np.nan)
+    spread_20 = spread_df.rolling(20).mean().replace([np.inf, -np.inf], np.nan)
+    liquidity = (
+        np.log1p(vol_mean_30).replace([np.inf, -np.inf], np.nan)
+        / (1.0 + amihud_20 * 1e6)
+    ).replace([np.inf, -np.inf], np.nan)
+
+    ema20 = close_df.ewm(span=20, adjust=False).mean()
+    ema60 = close_df.ewm(span=60, adjust=False).mean()
+    ema120 = close_df.ewm(span=120, adjust=False).mean()
+    ema_gap_20_60 = (ema20 / ema60 - 1.0).replace([np.inf, -np.inf], np.nan)
+    ema_gap_60_120 = (ema60 / ema120 - 1.0).replace([np.inf, -np.inf], np.nan)
 
     factor_ret = factor_df.pct_change().replace([np.inf, -np.inf], np.nan)
     m = config.data.market_symbol
@@ -179,45 +302,172 @@ def _build_features(
     mret = factor_ret[m]
     mvol = (mret.rolling(lb).std() * np.sqrt(252.0)).replace([np.inf, -np.inf], np.nan)
     regimes = _classify_regime(mret, mvol)
+    market_curve = (1.0 + mret.fillna(0.0)).cumprod()
+    market_peaks = np.maximum.accumulate(market_curve)
+    market_drawdown = (market_curve - market_peaks) / market_peaks
+
+    above_50 = (close_df > close_df.rolling(50).mean()).mean(axis=1)
+    above_200 = (close_df > close_df.rolling(200).mean()).mean(axis=1)
+    adv = (ret > 0).sum(axis=1).astype(float)
+    dec = (ret < 0).sum(axis=1).astype(float)
+    advance_decline = adv / (dec + 1e-6)
+    market_dispersion = ret.std(axis=1)
 
     g = pd.DataFrame(index=close_df.index)
     g["market_ret"] = mret
     g["market_vol"] = mvol
     g["market_trend"] = (factor_df[m] / factor_df[m].rolling(lb).mean()) - 1.0
-    curve = (1.0 + mret.fillna(0.0)).cumprod()
-    g["market_drawdown"] = (curve - np.maximum.accumulate(curve)) / np.maximum.accumulate(curve)
+    g["market_drawdown"] = market_drawdown
+    g["market_max_drawdown_90d"] = market_drawdown.rolling(90).min()
+    g["market_skew_30d"] = mret.rolling(30).skew()
+    g["market_kurtosis_30d"] = mret.rolling(30).kurt()
+    g["market_tail_risk_30d"] = mret.rolling(30).quantile(0.05)
+    g["breadth_above_50dma"] = above_50
+    g["breadth_above_200dma"] = above_200
+    g["advance_decline_ratio"] = advance_decline
+    g["market_dispersion"] = market_dispersion
+    g["vol_to_equity_ratio"] = (factor_df[v] / factor_df[m]).replace([np.inf, -np.inf], np.nan)
+    g["vol_momentum_20d"] = factor_df[v].pct_change(20)
     g[f"vol_ret_{v}"] = factor_ret[v]
     g[f"vol_z_{v}"] = _rolling_z(factor_df[v], lb)
+
+    bond_symbol = config.data.rate_symbols[0] if config.data.rate_symbols else m
+    g["equity_bond_ratio"] = (factor_df[m] / factor_df[bond_symbol]).replace([np.inf, -np.inf], np.nan)
+    if len(config.data.rate_symbols) >= 2:
+        left = factor_ret[config.data.rate_symbols[0]]
+        right = factor_ret[config.data.rate_symbols[1]]
+        g["yield_curve_slope_proxy"] = left - right
+    else:
+        g["yield_curve_slope_proxy"] = factor_ret[bond_symbol]
+
     for s in config.data.rate_symbols:
         g[f"rate_ret_{s}"] = factor_ret[s]
     for s in config.data.cross_asset_symbols:
         g[f"cross_ret_{s}"] = factor_ret[s]
+
+    g["gold_momentum_60d"] = factor_df["GLD"].pct_change(60) if "GLD" in factor_df.columns else 0.0
+    g["oil_momentum_60d"] = factor_df["USO"].pct_change(60) if "USO" in factor_df.columns else 0.0
+    market_ema20 = factor_df[m].ewm(span=20, adjust=False).mean()
+    market_ema60 = factor_df[m].ewm(span=60, adjust=False).mean()
+    market_ema200 = factor_df[m].ewm(span=200, adjust=False).mean()
+    g["market_ema_gap_20_60"] = (market_ema20 / market_ema60 - 1.0).replace([np.inf, -np.inf], np.nan)
+    g["market_ema_gap_60_200"] = (market_ema60 / market_ema200 - 1.0).replace([np.inf, -np.inf], np.nan)
+    g["market_trend_slope_60"] = factor_df[m].pct_change(60) / 60.0
+
     for label in ("bull", "bear", "volatile", "sideways"):
         g[f"regime_{label}"] = (regimes == label).astype(float)
 
+    m_mom_20 = factor_df[m].pct_change(20).replace([np.inf, -np.inf], np.nan)
+    ret_mean = ret.mean(axis=1)
+    ret_std = ret.std(axis=1).replace(0.0, np.nan)
+    ret_zscore = ret.sub(ret_mean, axis=0).div(ret_std, axis=0).replace([np.inf, -np.inf], np.nan)
+
+    stock_feature_frames: dict[str, pd.DataFrame] = {
+        "mom_5d": momentum_map[5],
+        "mom_20d": momentum_map[20],
+        "mom_60d": momentum_map[60],
+        "mom_120d": momentum_map[120],
+        "mom_252d": momentum_map[252],
+        "vol_10d": vol_10,
+        "vol_30d": vol_30,
+        "vol_90d": vol_90,
+        "vol_252d": vol_252,
+        "vol_of_vol_30d": vol_of_vol_30,
+        "amihud_20d": amihud_20,
+        "turnover_ratio_30d": turnover_ratio_30,
+        "spread_proxy_20d": spread_20,
+        "volume_zscore_20d": volume_z_20,
+        "ema_gap_20_60": ema_gap_20_60,
+        "ema_gap_60_120": ema_gap_60_120,
+        "relative_strength_vs_market_20d": momentum_map[20].sub(m_mom_20, axis=0),
+        "zscore_return_cross_sectional": ret_zscore,
+    }
+    stock_feature_names = sorted(stock_feature_frames.keys())
+
     domain_factors: dict[str, pd.DataFrame] = {}
-    for domain, symbols in config.domain_to_stocks.items():
-        dret = ret[symbols].mean(axis=1)
+    for domain, symbols in domain_to_stocks.items():
+        subset = ret[symbols]
+        dret = subset.mean(axis=1)
+        dcurve = (1.0 + dret.fillna(0.0)).cumprod()
+        ddrawdown = (dcurve - np.maximum.accumulate(dcurve)) / np.maximum.accumulate(dcurve)
         sector = config.data.sector_etfs.get(domain, m)
         sret = factor_ret[sector] if sector in factor_ret.columns else dret
+
+        top_bottom = subset.apply(
+            lambda row: float(
+                row.sort_values().tail(max(1, len(symbols) // 5)).mean()
+                - row.sort_values().head(max(1, len(symbols) // 5)).mean()
+            ),
+            axis=1,
+        )
+        intra_corr = 1.0 - (
+            subset.std(axis=1) / (subset.abs().mean(axis=1) + 1e-6)
+        )
         f = pd.DataFrame(index=close_df.index)
         f["sector_ret"] = sret
         f["relative_strength"] = sret - mret
         f["beta_proxy"] = dret.rolling(lb).corr(mret).replace([np.inf, -np.inf], np.nan)
-        f["dispersion"] = ret[symbols].std(axis=1)
-        domain_factors[domain] = f
-    return momentum, volatility, liquidity, next_ret, g, domain_factors, regimes
+        f["dispersion"] = subset.std(axis=1)
+        f["cluster_momentum"] = close_df[symbols].mean(axis=1).pct_change(20)
+        f["cluster_volatility"] = subset.mean(axis=1).rolling(30).std() * np.sqrt(252.0)
+        f["cluster_drawdown"] = ddrawdown
+        sharpe_roll = dret.rolling(30).mean() / (dret.rolling(30).std().replace(0.0, np.nan))
+        f["cluster_sharpe_rolling"] = sharpe_roll * np.sqrt(252.0)
+        f["cluster_correlation_to_market"] = dret.rolling(30).corr(mret).replace([np.inf, -np.inf], np.nan)
+        f["cross_sectional_std_returns"] = subset.std(axis=1)
+        f["top_minus_bottom_quintile_return"] = top_bottom
+        f["intra_cluster_correlation"] = intra_corr
+        domain_factors[domain] = f.replace([np.inf, -np.inf], np.nan)
+
+    return (
+        momentum,
+        volatility,
+        liquidity,
+        stock_feature_frames,
+        stock_feature_names,
+        next_ret,
+        g.replace([np.inf, -np.inf], np.nan),
+        domain_factors,
+        regimes,
+    )
 
 
 def _prepare_data(config: ProjectConfig) -> PreparedData:
     provider, provider_label = _choose_provider(config)
     probe = next(iter(next(iter(config.domain_to_stocks.values()))))
     provider.fetch(symbol=probe, start_date=config.data.start_date, end_date=config.data.end_date, interval=config.data.interval)
-    close_df, volume_df, factor_df = _build_market_frames(config, provider)
-    momentum, volatility, liquidity, next_ret, global_df, domain_factors, regimes = _build_features(
+    close_df, volume_df, factor_df, spread_df = _build_market_frames(config, provider)
+    provisional_returns = close_df.pct_change().replace([np.inf, -np.inf], np.nan)
+    if config.data.use_learned_clusters:
+        learned_clusters = _learned_cluster_map(
+            config.domain_to_stocks,
+            provisional_returns,
+            cluster_count=config.data.learned_cluster_count,
+        )
+        domain_map = learned_clusters or {
+            str(name): list(symbols) for name, symbols in config.domain_to_stocks.items()
+        }
+    else:
+        domain_map = {
+            str(name): list(symbols) for name, symbols in config.domain_to_stocks.items()
+        }
+
+    (
+        momentum,
+        volatility,
+        liquidity,
+        stock_feature_frames,
+        stock_feature_names,
+        next_ret,
+        global_df,
+        domain_factors,
+        regimes,
+    ) = _build_features(
         config,
+        domain_map,
         close_df,
         volume_df,
+        spread_df,
         factor_df,
     )
     mask = (
@@ -230,13 +480,18 @@ def _prepare_data(config: ProjectConfig) -> PreparedData:
     )
     for frame in domain_factors.values():
         mask &= ~frame.isna().any(axis=1)
+    for frame in stock_feature_frames.values():
+        mask &= ~frame.isna().any(axis=1)
     dates = list(close_df.index[mask])
     if len(dates) < 80:
         raise ValueError("Not enough clean history for walk-forward training/testing")
     return PreparedData(
+        domain_to_stocks=domain_map,
         momentum_df=momentum,
         volatility_df=volatility,
         liquidity_df=liquidity,
+        stock_feature_frames=stock_feature_frames,
+        stock_feature_names=stock_feature_names,
         next_returns_df=next_ret,
         global_feature_df=global_df,
         domain_factor_frames=domain_factors,
@@ -247,7 +502,6 @@ def _prepare_data(config: ProjectConfig) -> PreparedData:
 
 
 def _build_states(
-    config: ProjectConfig,
     prepared: PreparedData,
     date: pd.Timestamp,
     remaining: int,
@@ -260,7 +514,7 @@ def _build_states(
     global_features = {
         c: float(prepared.global_feature_df.at[date, c]) for c in sorted(prepared.global_feature_df.columns)
     }
-    for domain, symbols in config.domain_to_stocks.items():
+    for domain, symbols in prepared.domain_to_stocks.items():
         sm = {s: float(prepared.momentum_df.at[date, s]) for s in symbols}
         sv = {s: float(prepared.volatility_df.at[date, s]) for s in symbols}
         sl = {s: float(prepared.liquidity_df.at[date, s]) for s in symbols}
@@ -268,8 +522,25 @@ def _build_states(
             c: float(prepared.domain_factor_frames[domain].at[date, c])
             for c in sorted(prepared.domain_factor_frames[domain].columns)
         }
-        dm[domain] = float(np.mean(list(sm.values())))
-        dv[domain] = float(np.mean(list(sv.values())))
+
+        mom_series = pd.Series(sm, dtype=float)
+        vol_series = pd.Series(sv, dtype=float)
+        mom_rank = mom_series.rank(pct=True, method="average").to_dict()
+        vol_rank = vol_series.rank(pct=True, method="average").to_dict()
+        mean_mom = float(mom_series.mean())
+        stock_features: dict[str, dict[str, float]] = {}
+        for stock in symbols:
+            base_features = {
+                name: float(prepared.stock_feature_frames[name].at[date, stock])
+                for name in prepared.stock_feature_names
+            }
+            base_features["stock_mom_rank_in_cluster"] = float(mom_rank.get(stock, 0.0))
+            base_features["stock_vol_rank"] = float(vol_rank.get(stock, 0.0))
+            base_features["relative_momentum"] = float(sm.get(stock, 0.0) - mean_mom)
+            stock_features[stock] = base_features
+
+        dm[domain] = float(sf.get("cluster_momentum", float(np.mean(list(sm.values())))))
+        dv[domain] = float(sf.get("cluster_volatility", float(np.mean(list(sv.values())))))
         dl[domain] = float(np.mean(list(sl.values())))
         alloc = dict(stock_allocs.get(domain, {}))
         if not alloc:
@@ -284,6 +555,7 @@ def _build_states(
             remaining_domain_steps=remaining,
             step_index=step_idx,
             domain_factors=sf,
+            stock_features=stock_features,
         )
     top_state = TopLevelState(
         domain_momentum=dm,
@@ -448,18 +720,21 @@ def _walk_splits(config: ProjectConfig, dates: list[pd.Timestamp]) -> list[tuple
 def _run_single(config: ProjectConfig, mode: str, seed: int, prepared: PreparedData) -> TrainingResult:
     g_count = len(prepared.global_feature_df.columns)
     d_count = len(next(iter(prepared.domain_factor_frames.values())).columns) if prepared.domain_factor_frames else 0
+    s_count = len(prepared.stock_feature_names)
     agent = build_hierarchical_agent(
         mode=mode,
-        domain_to_stocks=config.domain_to_stocks,
+        domain_to_stocks=prepared.domain_to_stocks,
         max_domain_hold_steps=config.rl.max_domain_hold_steps,
         max_stock_hold_steps=config.rl.max_stock_hold_steps,
         num_global_features=g_count,
         num_domain_factors=d_count,
+        num_stock_features=s_count,
+        stock_feature_names=prepared.stock_feature_names,
         rl_config=config.rl,
         stochastic_control=config.stochastic_control,
         seed=seed,
     )
-    domain_alloc, stock_allocs, prev_weights = _init_allocations(config.domain_to_stocks)
+    domain_alloc, stock_allocs, prev_weights = _init_allocations(prepared.domain_to_stocks)
     splits = _walk_splits(config, prepared.valid_dates)
 
     train_rewards: list[float] = []
@@ -476,12 +751,19 @@ def _run_single(config: ProjectConfig, mode: str, seed: int, prepared: PreparedD
     last_decision: HierarchicalDecision | None = None
     train_step = 0
     test_step = 0
+    max_training_steps = int(config.rl.training_steps) if int(config.rl.training_steps) > 0 else None
     total_windows = len(splits)
+    cluster_labels = ",".join(sorted(prepared.domain_to_stocks.keys()))
     print(
         f"[run] mode={mode} seed={seed} windows={total_windows} fine_tune_rounds={max(1, int(config.experiments.fine_tune_rounds))}",
         flush=True,
     )
+    print(
+        f"[domains] using={len(prepared.domain_to_stocks)} groups -> {cluster_labels}",
+        flush=True,
+    )
 
+    stop_training = False
     for window_idx, (tr_dates, te_dates, _start) in enumerate(splits):
         tr_offset = len(train_returns)
         te_offset = len(test_returns)
@@ -495,9 +777,13 @@ def _run_single(config: ProjectConfig, mode: str, seed: int, prepared: PreparedD
 
         for round_idx in range(rounds):
             print(f"  [epoch {round_idx + 1}/{rounds}] training...", flush=True)
+            active_train_decision: HierarchicalDecision | None = None
+            train_hold_remaining = 0
             for local_idx, date in enumerate(tr_dates):
+                if max_training_steps is not None and train_step >= max_training_steps:
+                    stop_training = True
+                    break
                 top_state, domain_states = _build_states(
-                    config=config,
                     prepared=prepared,
                     date=date,
                     remaining=len(tr_dates) - local_idx,
@@ -505,7 +791,20 @@ def _run_single(config: ProjectConfig, mode: str, seed: int, prepared: PreparedD
                     domain_alloc=domain_alloc,
                     stock_allocs=stock_allocs,
                 )
-                decision = agent.decide(top_state=top_state, domain_states=domain_states, stochastic=config.rl.stochastic_actions)
+                did_rebalance = active_train_decision is None or train_hold_remaining <= 0
+                if did_rebalance:
+                    decision = agent.decide(
+                        top_state=top_state,
+                        domain_states=domain_states,
+                        stochastic=config.rl.stochastic_actions,
+                    )
+                    active_train_decision = decision
+                    train_hold_remaining = max(1, int(decision.top_action.hold_steps)) - 1
+                else:
+                    decision = active_train_decision
+                    train_hold_remaining = max(0, train_hold_remaining - 1)
+
+                assert decision is not None
                 last_decision = decision
                 train_domain_allocs.append(dict(decision.final_domain_weights))
                 gross = _portfolio_return(decision, prepared.next_returns_df.loc[date])
@@ -524,7 +823,6 @@ def _run_single(config: ProjectConfig, mode: str, seed: int, prepared: PreparedD
                     next_stock_allocs[domain] = dict(action.stock_weights)
                 next_date = tr_dates[min(local_idx + 1, len(tr_dates) - 1)]
                 next_top_state, next_domain_states = _build_states(
-                    config=config,
                     prepared=prepared,
                     date=next_date,
                     remaining=max(0, len(tr_dates) - local_idx - 1),
@@ -533,20 +831,21 @@ def _run_single(config: ProjectConfig, mode: str, seed: int, prepared: PreparedD
                     stock_allocs=next_stock_allocs,
                 )
                 done = local_idx == len(tr_dates) - 1
-                step_losses = _train_step(
-                    agent=agent,
-                    top_state=top_state,
-                    domain_states=domain_states,
-                    next_top_state=next_top_state,
-                    next_domain_states=next_domain_states,
-                    decision=decision,
-                    reward=reward,
-                    done=done,
-                )
-                if step_losses:
-                    row = {"window": float(window_idx), "round": float(round_idx), "step": float(train_step)}
-                    row.update(step_losses)
-                    losses.append(row)
+                if did_rebalance:
+                    step_losses = _train_step(
+                        agent=agent,
+                        top_state=top_state,
+                        domain_states=domain_states,
+                        next_top_state=next_top_state,
+                        next_domain_states=next_domain_states,
+                        decision=decision,
+                        reward=reward,
+                        done=done,
+                    )
+                    if step_losses:
+                        row = {"window": float(window_idx), "round": float(round_idx), "step": float(train_step)}
+                        row.update(step_losses)
+                        losses.append(row)
                 domain_alloc = next_domain_alloc
                 stock_allocs = next_stock_allocs
                 prev_weights = dict(decision.final_stock_weights)
@@ -554,14 +853,19 @@ def _run_single(config: ProjectConfig, mode: str, seed: int, prepared: PreparedD
                 if (local_idx + 1) % train_log_every == 0 or local_idx + 1 == len(tr_dates):
                     print(
                         f"    epoch={round_idx + 1}/{rounds} step={local_idx + 1}/{len(tr_dates)} "
-                        f"reward={reward:.5f} gross={gross:.5f}",
+                        f"reward={reward:.5f} gross={gross:.5f} rebalance={int(did_rebalance)} hold_left={train_hold_remaining}",
                         flush=True,
                     )
+            if stop_training:
+                break
+        if stop_training:
+            print("  [training cap reached] stopping further train updates for this run", flush=True)
 
         print("  [eval] testing...", flush=True)
+        active_test_decision: HierarchicalDecision | None = None
+        test_hold_remaining = 0
         for local_idx, date in enumerate(te_dates):
             top_state, domain_states = _build_states(
-                config=config,
                 prepared=prepared,
                 date=date,
                 remaining=len(te_dates) - local_idx,
@@ -569,7 +873,16 @@ def _run_single(config: ProjectConfig, mode: str, seed: int, prepared: PreparedD
                 domain_alloc=domain_alloc,
                 stock_allocs=stock_allocs,
             )
-            decision = agent.decide(top_state=top_state, domain_states=domain_states, stochastic=False)
+            did_rebalance = active_test_decision is None or test_hold_remaining <= 0
+            if did_rebalance:
+                decision = agent.decide(top_state=top_state, domain_states=domain_states, stochastic=False)
+                active_test_decision = decision
+                test_hold_remaining = max(1, int(decision.top_action.hold_steps)) - 1
+            else:
+                decision = active_test_decision
+                test_hold_remaining = max(0, test_hold_remaining - 1)
+
+            assert decision is not None
             last_decision = decision
             test_domain_allocs.append(dict(decision.final_domain_weights))
             gross = _portfolio_return(decision, prepared.next_returns_df.loc[date])
@@ -588,7 +901,7 @@ def _run_single(config: ProjectConfig, mode: str, seed: int, prepared: PreparedD
             test_step += 1
             if (local_idx + 1) % test_log_every == 0 or local_idx + 1 == len(te_dates):
                 print(
-                    f"    test_step={local_idx + 1}/{len(te_dates)} gross={gross:.5f}",
+                    f"    test_step={local_idx + 1}/{len(te_dates)} gross={gross:.5f} rebalance={int(did_rebalance)} hold_left={test_hold_remaining}",
                     flush=True,
                 )
 
@@ -609,6 +922,9 @@ def _run_single(config: ProjectConfig, mode: str, seed: int, prepared: PreparedD
             f"test_cum={_metrics(test_returns[te_offset:], config.reward.cvar_alpha).cumulative_return:.5f}",
             flush=True,
         )
+        if stop_training:
+            # Continue evaluating remaining windows but skip further train rounds.
+            pass
 
     if last_decision is None:
         raise ValueError("No decision generated in training run")
