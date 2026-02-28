@@ -1,102 +1,151 @@
-# HMADRL Portfolio Agent
+# Hierarchical Multi-Agent Deep RL for Portfolio Management
 
-Hierarchical multi-agent portfolio framework with:
+End-to-end hierarchical portfolio system with:
 
-- Top layer (`Portfolio Manager`): allocates capital across domains and chooses domain hold duration.
-- Domain layer (`Domain Managers`): allocates capital among stocks within each domain and chooses stock hold duration.
+- A top allocator (switchable RL or MoE router)
+- Multiple lower allocation agents (domain/cluster level)
+- Stochastic control constraints
+- Walk-forward training/evaluation on real market data
 
-Top layer is switchable:
+The project is designed for experimentation and reproducible research with modular components in `hmadrl/`.
 
-- `rl`: DQN-based top allocator.
-- `moe_router`: MoE-style router logic (router chooses expert allocator).
+## What This Repo Does
 
-Top-down stochastic control is active:
+1. Fetches real data (`stooq` and/or `yfinance`) for stocks + macro/factor symbols.
+2. Builds rich multi-scale features (stock, domain, global).
+3. Builds hierarchical states:
+   - `TopLevelState` for the top manager
+   - `DomainState` for each lower manager
+4. Produces hierarchical actions:
+   - top domain weights + hold horizon
+   - per-domain stock weights + hold horizon
+5. Applies stochastic control mediation (`capital_budget`, `risk_budget`, caps, hold constraints).
+6. Runs walk-forward train/test windows with cost-aware rewards.
+7. Saves metrics, CSVs, plots, and summaries to `results/`.
 
-- Portfolio manager emits domain control signals (`capital_budget`, `risk_budget`, `max_stock_weight`, `hold_steps`).
-- Domain managers must satisfy those constraints when selecting stock actions.
+## Architecture
 
-## State And Action Spaces
+### Top Layer (Strategy Allocation)
 
-### Top Layer
+- `mode=rl`: `RLTopManager` (continuous PPO ensemble; optional transformer top network).
+- `mode=moe_router`: `MoERouterTopManager` (router selecting experts: momentum/low-vol/liquidity).
 
-- State (`TopLevelState`):
-  - `domain_momentum[d]`
-  - `domain_volatility[d]`
-  - `domain_liquidity[d]`
-  - `current_allocation[d]`
-  - `remaining_horizon_steps`
-  - `step_index`
-  - `cash_ratio`
-- Action (`TopLevelAction`):
-  - `domain_weights[d]`
-  - `hold_steps` (domain-level investment duration)
+Output:
+- domain/cluster allocation weights
+- top hold duration
 
-### Domain Layer
+### Lower Layer (Stock Allocation)
 
-- State (`DomainState`):
-  - `stock_momentum[s]`
-  - `stock_volatility[s]`
-  - `stock_liquidity[s]`
-  - `current_stock_allocation[s]`
-  - `remaining_domain_steps`
-  - `step_index`
-- Action (`DomainAction`):
-  - `stock_weights[s]`
-  - `hold_steps` (stock-level investment duration, capped by top-layer hold)
+- `DomainRLManager` uses continuous SAC ensemble.
+- Produces stock-level weights + stock hold duration.
+- Post-processed with stochastic control constraints.
 
-## Data API
+### Control Layer
 
-Real market data is fetched through free providers (`hmadrl/data_api.py`):
+`StochasticController` computes dynamic per-domain controls from momentum/vol/liquidity + global stress:
 
-- `yfinance` (Yahoo)
-- `stooq` CSV endpoint
-- `auto` mode tries `stooq` first, then `yfinance`
+- `capital_budget`
+- `risk_budget`
+- `max_stock_weight`
+- `hold_steps`
 
-## Config
+## Data And Features
 
-Edit `config/default_config.json` to change:
+The pipeline supports:
 
-- top mode (`rl` or `moe_router`)
-- domains and ticker sets
-- hold horizons
-- training steps
-- data range and interval
-- provider mode (`yfinance`, `stooq`, or `auto`)
-- lookback window / train-test split / cache directory
-- stochastic-control parameters
-- batch experiment settings (`modes`, `seeds`, `results_dir`, `run_name`)
+- Multi-horizon momentum and volatility
+- Liquidity and microstructure proxies
+- Cross-sectional stock signals
+- Domain/cluster factors
+- Global regime and macro signals
+
+Data providers:
+
+- `stooq` (free)
+- `yfinance` (free)
+- `auto` fallback chain (`stooq -> yfinance`)
+
+## Main Files
+
+- `hmadrl/pipeline.py`: data prep, feature engineering, walk-forward train/test, artifacts
+- `hmadrl/top_manager.py`: top-layer RL and MoE router logic
+- `hmadrl/domain_manager.py`: lower-layer SAC manager
+- `hmadrl/stochastic_control.py`: risk mediation/control equations
+- `hmadrl/rl_core.py`: PPO/SAC implementations
+- `hmadrl/factory.py`: manager/agent assembly by mode
+- `run_experiment.py`: CLI entry point
+
+## Setup
+
+Windows (PowerShell):
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
 
 ## Run
 
-Install dependencies in venv:
-
-```bash
-.venv\Scripts\python -m pip install -r requirements.txt
-```
-
 Run tests:
 
-```bash
-.venv\Scripts\python -m unittest discover -s tests -v
+```powershell
+python -m unittest discover -s tests -v
 ```
 
-Run batch experiments (default):
+Run a quick smoke batch:
 
-```bash
-.venv\Scripts\python run_experiment.py --config config/default_config.json
+```powershell
+python run_experiment.py --config config/smoke_config.json
 ```
 
-Run only one experiment:
+Run full batch:
 
-```bash
-.venv\Scripts\python run_experiment.py --config config/default_config.json --single
+```powershell
+python run_experiment.py --config config/default_config.json
 ```
 
-Outputs are saved under `results/<run_name>_<timestamp>/`:
+Run a single experiment only:
 
-- `batch_summary.csv`, `batch_summary.json`
-- per-run folder with:
-  - `summary.json`
-  - `train_returns.csv`, `test_returns.csv`, `losses.csv`
-  - `train_domain_allocations.csv`, `test_domain_allocations.csv`
-  - plots: `reward_curve.png`, `equity_curve.png`, `drawdown_curve.png`, and domain allocation charts
+```powershell
+python run_experiment.py --config config/default_config.json --single
+```
+
+## Outputs
+
+Results are written to:
+
+`results/<run_name>_<timestamp>/`
+
+Batch-level artifacts:
+
+- `batch_summary.csv`
+- `batch_summary.json`
+- `batch_cumulative_returns.png`
+
+Per-run artifacts:
+
+- `summary.json`
+- `train_returns.csv`, `test_returns.csv`
+- `losses.csv` (if available)
+- `reward_components.csv`
+- `walk_forward_windows.csv`
+- plots: reward, equity, drawdown, allocation, regime returns
+
+## Branch Notes
+
+- `master`: stable baseline
+- `nondomain`: active research branch (newer modeling/feature experiments)
+
+To switch:
+
+```powershell
+git switch master
+# or
+git switch nondomain
+```
+
+## Disclaimer
+
+This repository is for research/engineering experimentation, not financial advice. Live trading requires additional execution, risk, and compliance controls.
