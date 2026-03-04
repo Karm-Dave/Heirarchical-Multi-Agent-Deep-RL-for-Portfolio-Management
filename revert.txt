@@ -22,3 +22,9 @@ Non-destructive way to inspect that version:
 
 git switch --detach 7c02873
 
+# Checkpoint: temporal leakage fixes (2026-03-04)
+# Restore branch exactly to this checkpoint:
+git switch experimental_except_yep
+git reset --hard 47d2a22
+# Non-destructive inspection:
+git switch --detach 47d2a22
