@@ -78,6 +78,9 @@ class PreparedData:
     domain_factor_frames: dict[str, pd.DataFrame]
     valid_dates: list[pd.Timestamp]
     regimes: pd.Series
+    close_df: pd.DataFrame
+    returns_df: pd.DataFrame
+    factor_returns_df: pd.DataFrame
     provider_label: str
 
 
@@ -156,16 +159,25 @@ def _rolling_z(series: pd.Series, lookback: int) -> pd.Series:
 
 
 def _classify_regime(ret: pd.Series, vol: pd.Series) -> pd.Series:
-    q50, q75 = float(vol.quantile(0.5)), float(vol.quantile(0.75))
-    labels = pd.Series(index=ret.index, dtype=object)
+    """Past-only regime classification using expanding volatility quantiles."""
+
+    hist_vol = vol.shift(1)
+    q50 = hist_vol.expanding(min_periods=40).quantile(0.50).ffill()
+    q75 = hist_vol.expanding(min_periods=40).quantile(0.75).ffill()
+    labels = pd.Series("sideways", index=ret.index, dtype=object)
     for date in ret.index:
-        r = float(ret.loc[date])
-        v = float(vol.loc[date])
-        if r >= 0.0 and v <= q50:
+        r = float(ret.loc[date]) if pd.notna(ret.loc[date]) else np.nan
+        v = float(vol.loc[date]) if pd.notna(vol.loc[date]) else np.nan
+        median = float(q50.loc[date]) if pd.notna(q50.loc[date]) else np.nan
+        high = float(q75.loc[date]) if pd.notna(q75.loc[date]) else np.nan
+        if np.isnan(r) or np.isnan(v) or np.isnan(median) or np.isnan(high):
+            labels.loc[date] = "sideways"
+            continue
+        if r >= 0.0 and v <= median:
             labels.loc[date] = "bull"
-        elif r < 0.0 and v >= q75:
+        elif r < 0.0 and v >= high:
             labels.loc[date] = "bear"
-        elif v >= q75:
+        elif v >= high:
             labels.loc[date] = "volatile"
         else:
             labels.loc[date] = "sideways"
@@ -184,7 +196,7 @@ def _learned_cluster_map(
         return {"cluster_00": stocks}
 
     k = max(1, min(int(cluster_count), len(stocks)))
-    corr = returns_df[stocks].corr().fillna(0.0)
+    corr = returns_df[stocks].corr(min_periods=20).fillna(0.0)
     dist = 1.0 - corr
     variances = returns_df[stocks].var().fillna(0.0)
     first_seed = str(variances.sort_values(ascending=False).index[0])
@@ -224,8 +236,168 @@ def _learned_cluster_map(
                     cluster_assignments[target].append(donor_symbols.pop())
                     break
 
-    # Drop any empty clusters that still remain.
-    return {name: symbols for name, symbols in cluster_assignments.items() if symbols}
+    # Keep deterministic label space for rolling windows.
+    return {name: symbols for name, symbols in cluster_assignments.items()}
+
+
+@dataclass(frozen=True)
+class _RegimeNormalizer:
+    base_mean: pd.Series
+    base_std: pd.Series
+    by_regime: dict[str, tuple[pd.Series, pd.Series]]
+
+
+def _fit_regime_normalizer(
+    frame: pd.DataFrame,
+    regimes: pd.Series,
+    train_dates: list[pd.Timestamp],
+) -> _RegimeNormalizer:
+    train_idx = pd.Index(train_dates)
+    train_frame = frame.loc[train_idx]
+    train_regimes = regimes.loc[train_idx]
+    base_mean = train_frame.mean(axis=0)
+    base_std = train_frame.std(axis=0).replace(0.0, np.nan).fillna(1.0)
+
+    by_regime: dict[str, tuple[pd.Series, pd.Series]] = {}
+    for regime_name in sorted(set(str(v) for v in train_regimes.values)):
+        mask = train_regimes == regime_name
+        subset = train_frame.loc[mask]
+        if subset.empty:
+            continue
+        mean = subset.mean(axis=0)
+        std = subset.std(axis=0).replace(0.0, np.nan).fillna(1.0)
+        by_regime[regime_name] = (mean, std)
+    return _RegimeNormalizer(base_mean=base_mean, base_std=base_std, by_regime=by_regime)
+
+
+def _apply_regime_normalizer(
+    frame: pd.DataFrame,
+    regimes: pd.Series,
+    normalizer: _RegimeNormalizer,
+) -> pd.DataFrame:
+    out = frame.sub(normalizer.base_mean, axis=1).div(normalizer.base_std, axis=1)
+    for regime_name, (mean, std) in normalizer.by_regime.items():
+        mask = regimes == regime_name
+        if not bool(mask.any()):
+            continue
+        out.loc[mask] = frame.loc[mask].sub(mean, axis=1).div(std, axis=1)
+    return out.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+
+def _normalize_frames_by_window(
+    frames: Mapping[str, pd.DataFrame],
+    regimes: pd.Series,
+    train_dates: list[pd.Timestamp],
+) -> dict[str, pd.DataFrame]:
+    normalized: dict[str, pd.DataFrame] = {}
+    for name, frame in frames.items():
+        norm = _fit_regime_normalizer(frame, regimes, train_dates)
+        normalized[name] = _apply_regime_normalizer(frame, regimes, norm)
+    return normalized
+
+
+def _normalize_frame_by_window(
+    frame: pd.DataFrame,
+    regimes: pd.Series,
+    train_dates: list[pd.Timestamp],
+) -> pd.DataFrame:
+    norm = _fit_regime_normalizer(frame, regimes, train_dates)
+    return _apply_regime_normalizer(frame, regimes, norm)
+
+
+def _kmeans_numpy(values: np.ndarray, k: int, seed: int, iters: int = 25) -> np.ndarray:
+    if values.shape[0] == 0:
+        return np.zeros((k, values.shape[1]), dtype=float)
+    rng = np.random.default_rng(seed)
+    k = max(1, min(k, values.shape[0]))
+    if values.shape[0] == 1:
+        return np.repeat(values, repeats=k, axis=0)
+    idx = rng.choice(values.shape[0], size=k, replace=False)
+    centers = values[idx].copy()
+    for _ in range(max(3, iters)):
+        dist = np.square(values[:, None, :] - centers[None, :, :]).sum(axis=2)
+        labels = np.argmin(dist, axis=1)
+        new_centers = centers.copy()
+        for j in range(k):
+            members = values[labels == j]
+            if members.shape[0] > 0:
+                new_centers[j] = members.mean(axis=0)
+        if np.allclose(new_centers, centers, atol=1e-6):
+            centers = new_centers
+            break
+        centers = new_centers
+    return centers
+
+
+def _build_market_state_embeddings(
+    global_df: pd.DataFrame,
+    train_dates: list[pd.Timestamp],
+    latent_k: int,
+    seed: int,
+) -> pd.DataFrame:
+    cols = [f"latent_regime_{i:02d}" for i in range(max(1, latent_k))]
+    if global_df.empty:
+        return pd.DataFrame(0.0, index=global_df.index, columns=cols)
+    train_idx = pd.Index(train_dates)
+    fit_x = global_df.loc[train_idx].to_numpy(dtype=float)
+    fit_x = np.nan_to_num(fit_x, nan=0.0, posinf=0.0, neginf=0.0)
+    centers = _kmeans_numpy(fit_x, k=max(1, latent_k), seed=seed)
+    full_x = np.nan_to_num(global_df.to_numpy(dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+    dist = np.square(full_x[:, None, :] - centers[None, :, :]).sum(axis=2)
+    labels = np.argmin(dist, axis=1)
+    out = pd.DataFrame(0.0, index=global_df.index, columns=cols)
+    for i, label in enumerate(labels):
+        col = cols[int(label)]
+        out.iat[i, out.columns.get_loc(col)] = 1.0
+    return out
+
+
+def _build_domain_factors(
+    config: ProjectConfig,
+    domain_to_stocks: Mapping[str, list[str]],
+    close_df: pd.DataFrame,
+    returns_df: pd.DataFrame,
+    factor_returns_df: pd.DataFrame,
+) -> dict[str, pd.DataFrame]:
+    lb = max(2, config.data.lookback)
+    m = config.data.market_symbol
+    mret = factor_returns_df[m]
+    domain_factors: dict[str, pd.DataFrame] = {}
+    for domain, symbols in domain_to_stocks.items():
+        clean_symbols = [s for s in symbols if s in returns_df.columns]
+        if not clean_symbols:
+            continue
+        subset = returns_df[clean_symbols]
+        dret = subset.mean(axis=1)
+        dcurve = (1.0 + dret.fillna(0.0)).cumprod()
+        ddrawdown = (dcurve - np.maximum.accumulate(dcurve)) / np.maximum.accumulate(dcurve)
+        sector = config.data.sector_etfs.get(domain, m)
+        sret = factor_returns_df[sector] if sector in factor_returns_df.columns else dret
+
+        top_bottom = subset.apply(
+            lambda row: float(
+                row.sort_values().tail(max(1, len(clean_symbols) // 5)).mean()
+                - row.sort_values().head(max(1, len(clean_symbols) // 5)).mean()
+            ),
+            axis=1,
+        )
+        intra_corr = 1.0 - (subset.std(axis=1) / (subset.abs().mean(axis=1) + 1e-6))
+        f = pd.DataFrame(index=close_df.index)
+        f["sector_ret"] = sret
+        f["relative_strength"] = sret - mret
+        f["beta_proxy"] = dret.rolling(lb).corr(mret).replace([np.inf, -np.inf], np.nan)
+        f["dispersion"] = subset.std(axis=1)
+        f["cluster_momentum"] = close_df[clean_symbols].mean(axis=1).pct_change(20)
+        f["cluster_volatility"] = subset.mean(axis=1).rolling(30).std() * np.sqrt(252.0)
+        f["cluster_drawdown"] = ddrawdown
+        sharpe_roll = dret.rolling(30).mean() / (dret.rolling(30).std().replace(0.0, np.nan))
+        f["cluster_sharpe_rolling"] = sharpe_roll * np.sqrt(252.0)
+        f["cluster_correlation_to_market"] = dret.rolling(30).corr(mret).replace([np.inf, -np.inf], np.nan)
+        f["cross_sectional_std_returns"] = subset.std(axis=1)
+        f["top_minus_bottom_quintile_return"] = top_bottom
+        f["intra_cluster_correlation"] = intra_corr
+        domain_factors[domain] = f.replace([np.inf, -np.inf], np.nan)
+    return domain_factors
 
 
 def _build_features(
@@ -384,40 +556,19 @@ def _build_features(
     }
     stock_feature_names = sorted(stock_feature_frames.keys())
 
-    domain_factors: dict[str, pd.DataFrame] = {}
-    for domain, symbols in domain_to_stocks.items():
-        subset = ret[symbols]
-        dret = subset.mean(axis=1)
-        dcurve = (1.0 + dret.fillna(0.0)).cumprod()
-        ddrawdown = (dcurve - np.maximum.accumulate(dcurve)) / np.maximum.accumulate(dcurve)
-        sector = config.data.sector_etfs.get(domain, m)
-        sret = factor_ret[sector] if sector in factor_ret.columns else dret
-
-        top_bottom = subset.apply(
-            lambda row: float(
-                row.sort_values().tail(max(1, len(symbols) // 5)).mean()
-                - row.sort_values().head(max(1, len(symbols) // 5)).mean()
-            ),
-            axis=1,
-        )
-        intra_corr = 1.0 - (
-            subset.std(axis=1) / (subset.abs().mean(axis=1) + 1e-6)
-        )
-        f = pd.DataFrame(index=close_df.index)
-        f["sector_ret"] = sret
-        f["relative_strength"] = sret - mret
-        f["beta_proxy"] = dret.rolling(lb).corr(mret).replace([np.inf, -np.inf], np.nan)
-        f["dispersion"] = subset.std(axis=1)
-        f["cluster_momentum"] = close_df[symbols].mean(axis=1).pct_change(20)
-        f["cluster_volatility"] = subset.mean(axis=1).rolling(30).std() * np.sqrt(252.0)
-        f["cluster_drawdown"] = ddrawdown
-        sharpe_roll = dret.rolling(30).mean() / (dret.rolling(30).std().replace(0.0, np.nan))
-        f["cluster_sharpe_rolling"] = sharpe_roll * np.sqrt(252.0)
-        f["cluster_correlation_to_market"] = dret.rolling(30).corr(mret).replace([np.inf, -np.inf], np.nan)
-        f["cross_sectional_std_returns"] = subset.std(axis=1)
-        f["top_minus_bottom_quintile_return"] = top_bottom
-        f["intra_cluster_correlation"] = intra_corr
-        domain_factors[domain] = f.replace([np.inf, -np.inf], np.nan)
+    # Macro/global features and regime labels are lagged so decisions only use past information.
+    g = g.shift(1)
+    regimes = regimes.shift(1).fillna("sideways")
+    domain_factors = {
+        name: frame.shift(1)
+        for name, frame in _build_domain_factors(
+            config=config,
+            domain_to_stocks=domain_to_stocks,
+            close_df=close_df,
+            returns_df=ret,
+            factor_returns_df=factor_ret,
+        ).items()
+    }
 
     return (
         momentum,
@@ -437,20 +588,11 @@ def _prepare_data(config: ProjectConfig) -> PreparedData:
     probe = next(iter(next(iter(config.domain_to_stocks.values()))))
     provider.fetch(symbol=probe, start_date=config.data.start_date, end_date=config.data.end_date, interval=config.data.interval)
     close_df, volume_df, factor_df, spread_df = _build_market_frames(config, provider)
-    provisional_returns = close_df.pct_change().replace([np.inf, -np.inf], np.nan)
-    if config.data.use_learned_clusters:
-        learned_clusters = _learned_cluster_map(
-            config.domain_to_stocks,
-            provisional_returns,
-            cluster_count=config.data.learned_cluster_count,
-        )
-        domain_map = learned_clusters or {
-            str(name): list(symbols) for name, symbols in config.domain_to_stocks.items()
-        }
-    else:
-        domain_map = {
-            str(name): list(symbols) for name, symbols in config.domain_to_stocks.items()
-        }
+    domain_map = {
+        str(name): list(symbols) for name, symbols in config.domain_to_stocks.items()
+    }
+    returns_df = close_df.pct_change().replace([np.inf, -np.inf], np.nan)
+    factor_returns_df = factor_df.pct_change().replace([np.inf, -np.inf], np.nan)
 
     (
         momentum,
@@ -497,6 +639,9 @@ def _prepare_data(config: ProjectConfig) -> PreparedData:
         domain_factor_frames=domain_factors,
         valid_dates=dates,
         regimes=regimes,
+        close_df=close_df,
+        returns_df=returns_df,
+        factor_returns_df=factor_returns_df,
         provider_label=provider_label,
     )
 
@@ -508,20 +653,49 @@ def _build_states(
     step_idx: int,
     domain_alloc: Mapping[str, float],
     stock_allocs: Mapping[str, Mapping[str, float]],
+    domain_to_stocks: Mapping[str, list[str]] | None = None,
+    domain_factor_frames: Mapping[str, pd.DataFrame] | None = None,
+    global_feature_df: pd.DataFrame | None = None,
+    stock_feature_frames: Mapping[str, pd.DataFrame] | None = None,
+    stock_feature_names: list[str] | None = None,
+    momentum_df: pd.DataFrame | None = None,
+    volatility_df: pd.DataFrame | None = None,
+    liquidity_df: pd.DataFrame | None = None,
+    include_global_features: bool = True,
+    include_liquidity_features: bool = True,
 ) -> tuple[TopLevelState, dict[str, DomainState]]:
+    domain_map = {str(k): list(v) for k, v in (domain_to_stocks or prepared.domain_to_stocks).items()}
+    d_factors = domain_factor_frames or prepared.domain_factor_frames
+    g_frame = global_feature_df if global_feature_df is not None else prepared.global_feature_df
+    s_frames = stock_feature_frames or prepared.stock_feature_frames
+    s_names = stock_feature_names or prepared.stock_feature_names
+    mom_df = momentum_df if momentum_df is not None else prepared.momentum_df
+    vol_df = volatility_df if volatility_df is not None else prepared.volatility_df
+    liq_df = liquidity_df if liquidity_df is not None else prepared.liquidity_df
+
     dm, dv, dl = {}, {}, {}
     domain_states: dict[str, DomainState] = {}
-    global_features = {
-        c: float(prepared.global_feature_df.at[date, c]) for c in sorted(prepared.global_feature_df.columns)
-    }
-    for domain, symbols in prepared.domain_to_stocks.items():
-        sm = {s: float(prepared.momentum_df.at[date, s]) for s in symbols}
-        sv = {s: float(prepared.volatility_df.at[date, s]) for s in symbols}
-        sl = {s: float(prepared.liquidity_df.at[date, s]) for s in symbols}
-        sf = {
-            c: float(prepared.domain_factor_frames[domain].at[date, c])
-            for c in sorted(prepared.domain_factor_frames[domain].columns)
-        }
+    global_features = (
+        {c: float(g_frame.at[date, c]) for c in sorted(g_frame.columns)}
+        if include_global_features
+        else {}
+    )
+    for domain, symbols in domain_map.items():
+        sm = {s: float(mom_df.at[date, s]) for s in symbols}
+        sv = {s: float(vol_df.at[date, s]) for s in symbols}
+        sl = (
+            {s: float(liq_df.at[date, s]) for s in symbols}
+            if include_liquidity_features
+            else {s: 0.0 for s in symbols}
+        )
+        factor_frame = d_factors.get(domain)
+        if factor_frame is None or factor_frame.empty:
+            sf = {}
+        else:
+            sf = {
+                c: float(factor_frame.at[date, c])
+                for c in sorted(factor_frame.columns)
+            }
 
         mom_series = pd.Series(sm, dtype=float)
         vol_series = pd.Series(sv, dtype=float)
@@ -531,12 +705,16 @@ def _build_states(
         stock_features: dict[str, dict[str, float]] = {}
         for stock in symbols:
             base_features = {
-                name: float(prepared.stock_feature_frames[name].at[date, stock])
-                for name in prepared.stock_feature_names
+                name: float(s_frames[name].at[date, stock])
+                for name in s_names
             }
             base_features["stock_mom_rank_in_cluster"] = float(mom_rank.get(stock, 0.0))
             base_features["stock_vol_rank"] = float(vol_rank.get(stock, 0.0))
             base_features["relative_momentum"] = float(sm.get(stock, 0.0) - mean_mom)
+            if not include_liquidity_features:
+                for key in list(base_features.keys()):
+                    if "liq" in key.lower() or "liquid" in key.lower():
+                        base_features[key] = 0.0
             stock_features[stock] = base_features
 
         dm[domain] = float(sf.get("cluster_momentum", float(np.mean(list(sm.values())))))
@@ -579,8 +757,22 @@ def _portfolio_return(decision: HierarchicalDecision, next_row: pd.Series) -> fl
 
 
 def _turnover(prev_w: Mapping[str, float], new_w: Mapping[str, float]) -> float:
-    keys = set(prev_w) | set(new_w)
-    return float(sum(abs(float(new_w.get(k, 0.0)) - float(prev_w.get(k, 0.0))) for k in keys))
+    def _aggregate(weights: Mapping[str, float]) -> dict[str, float]:
+        out: dict[str, float] = {}
+        for key, value in weights.items():
+            stock = str(key).split(":", 1)[-1]
+            out[stock] = out.get(stock, 0.0) + float(value)
+        return out
+
+    prev_by_stock = _aggregate(prev_w)
+    new_by_stock = _aggregate(new_w)
+    keys = set(prev_by_stock) | set(new_by_stock)
+    return float(
+        sum(
+            abs(float(new_by_stock.get(k, 0.0)) - float(prev_by_stock.get(k, 0.0)))
+            for k in keys
+        )
+    )
 
 
 def _compute_cvar(values: list[float], alpha: float) -> float:
@@ -717,26 +909,96 @@ def _walk_splits(config: ProjectConfig, dates: list[pd.Timestamp]) -> list[tuple
     return [(dates[:idx], dates[idx:], 0)]
 
 
-def _run_single(config: ProjectConfig, mode: str, seed: int, prepared: PreparedData) -> TrainingResult:
-    g_count = len(prepared.global_feature_df.columns)
-    d_count = len(next(iter(prepared.domain_factor_frames.values())).columns) if prepared.domain_factor_frames else 0
-    s_count = len(prepared.stock_feature_names)
-    agent = build_hierarchical_agent(
-        mode=mode,
-        domain_to_stocks=prepared.domain_to_stocks,
-        max_domain_hold_steps=config.rl.max_domain_hold_steps,
-        max_stock_hold_steps=config.rl.max_stock_hold_steps,
-        num_global_features=g_count,
-        num_domain_factors=d_count,
-        num_stock_features=s_count,
-        stock_feature_names=prepared.stock_feature_names,
-        rl_config=config.rl,
-        stochastic_control=config.stochastic_control,
+@dataclass(frozen=True)
+class WindowFeatureContext:
+    domain_to_stocks: dict[str, list[str]]
+    momentum_df: pd.DataFrame
+    volatility_df: pd.DataFrame
+    liquidity_df: pd.DataFrame
+    stock_feature_frames: dict[str, pd.DataFrame]
+    stock_feature_names: list[str]
+    global_feature_df: pd.DataFrame
+    domain_factor_frames: dict[str, pd.DataFrame]
+    regimes: pd.Series
+
+
+def _resolve_window_domain_map(
+    config: ProjectConfig,
+    prepared: PreparedData,
+    train_dates: list[pd.Timestamp],
+) -> dict[str, list[str]]:
+    static_map = {
+        str(name): [s for s in symbols if s in prepared.returns_df.columns]
+        for name, symbols in config.domain_to_stocks.items()
+    }
+    static_map = {name: symbols for name, symbols in static_map.items() if symbols}
+    if not config.data.use_learned_clusters:
+        return static_map
+    train_returns = prepared.returns_df.loc[pd.Index(train_dates)]
+    learned = _learned_cluster_map(
+        config.domain_to_stocks,
+        returns_df=train_returns,
+        cluster_count=config.data.learned_cluster_count,
+    )
+    cleaned = {
+        str(name): [s for s in symbols if s in prepared.returns_df.columns]
+        for name, symbols in learned.items()
+    }
+    cleaned = {name: symbols for name, symbols in cleaned.items() if symbols}
+    return cleaned or static_map
+
+
+def _build_window_context(
+    config: ProjectConfig,
+    prepared: PreparedData,
+    train_dates: list[pd.Timestamp],
+    domain_map: Mapping[str, list[str]],
+    seed: int,
+) -> WindowFeatureContext:
+    regimes = prepared.regimes.copy()
+
+    momentum_df = _normalize_frame_by_window(prepared.momentum_df, regimes, train_dates)
+    volatility_df = _normalize_frame_by_window(prepared.volatility_df, regimes, train_dates)
+    liquidity_df = _normalize_frame_by_window(prepared.liquidity_df, regimes, train_dates)
+    stock_feature_frames = _normalize_frames_by_window(prepared.stock_feature_frames, regimes, train_dates)
+    global_feature_df = _normalize_frame_by_window(prepared.global_feature_df, regimes, train_dates)
+
+    latent_states = _build_market_state_embeddings(
+        global_df=global_feature_df,
+        train_dates=train_dates,
+        latent_k=4,
         seed=seed,
     )
-    domain_alloc, stock_allocs, prev_weights = _init_allocations(prepared.domain_to_stocks)
-    splits = _walk_splits(config, prepared.valid_dates)
+    global_feature_df = pd.concat([global_feature_df, latent_states], axis=1)
 
+    raw_domain_factors = _build_domain_factors(
+        config=config,
+        domain_to_stocks=domain_map,
+        close_df=prepared.close_df,
+        returns_df=prepared.returns_df,
+        factor_returns_df=prepared.factor_returns_df,
+    )
+    shifted_domain_factors = {
+        name: frame.shift(1)
+        for name, frame in raw_domain_factors.items()
+    }
+    domain_factor_frames = _normalize_frames_by_window(shifted_domain_factors, regimes, train_dates)
+
+    return WindowFeatureContext(
+        domain_to_stocks={str(k): list(v) for k, v in domain_map.items()},
+        momentum_df=momentum_df,
+        volatility_df=volatility_df,
+        liquidity_df=liquidity_df,
+        stock_feature_frames=stock_feature_frames,
+        stock_feature_names=list(prepared.stock_feature_names),
+        global_feature_df=global_feature_df,
+        domain_factor_frames=domain_factor_frames,
+        regimes=regimes,
+    )
+
+
+def _run_single(config: ProjectConfig, mode: str, seed: int, prepared: PreparedData) -> TrainingResult:
+    splits = _walk_splits(config, prepared.valid_dates)
     train_rewards: list[float] = []
     train_returns: list[float] = []
     test_returns: list[float] = []
@@ -753,18 +1015,47 @@ def _run_single(config: ProjectConfig, mode: str, seed: int, prepared: PreparedD
     test_step = 0
     max_training_steps = int(config.rl.training_steps) if int(config.rl.training_steps) > 0 else None
     total_windows = len(splits)
-    cluster_labels = ",".join(sorted(prepared.domain_to_stocks.keys()))
     print(
         f"[run] mode={mode} seed={seed} windows={total_windows} fine_tune_rounds={max(1, int(config.experiments.fine_tune_rounds))}",
-        flush=True,
-    )
-    print(
-        f"[domains] using={len(prepared.domain_to_stocks)} groups -> {cluster_labels}",
         flush=True,
     )
 
     stop_training = False
     for window_idx, (tr_dates, te_dates, _start) in enumerate(splits):
+        window_domain_map = _resolve_window_domain_map(config, prepared, tr_dates)
+        window_context = _build_window_context(
+            config=config,
+            prepared=prepared,
+            train_dates=tr_dates,
+            domain_map=window_domain_map,
+            seed=seed + window_idx * 101,
+        )
+        cluster_labels = ",".join(sorted(window_context.domain_to_stocks.keys()))
+        print(
+            f"[domains] window={window_idx + 1}/{total_windows} using={len(window_context.domain_to_stocks)} groups -> {cluster_labels}",
+            flush=True,
+        )
+        g_count = len(window_context.global_feature_df.columns)
+        d_count = (
+            len(next(iter(window_context.domain_factor_frames.values())).columns)
+            if window_context.domain_factor_frames
+            else 0
+        )
+        s_count = len(window_context.stock_feature_names)
+        agent = build_hierarchical_agent(
+            mode=mode,
+            domain_to_stocks=window_context.domain_to_stocks,
+            max_domain_hold_steps=config.rl.max_domain_hold_steps,
+            max_stock_hold_steps=config.rl.max_stock_hold_steps,
+            num_global_features=g_count,
+            num_domain_factors=d_count,
+            num_stock_features=s_count,
+            stock_feature_names=window_context.stock_feature_names,
+            rl_config=config.rl,
+            stochastic_control=config.stochastic_control,
+            seed=seed + window_idx * 13,
+        )
+        domain_alloc, stock_allocs, prev_weights = _init_allocations(window_context.domain_to_stocks)
         tr_offset = len(train_returns)
         te_offset = len(test_returns)
         rounds = max(1, int(config.experiments.fine_tune_rounds))
@@ -790,6 +1081,14 @@ def _run_single(config: ProjectConfig, mode: str, seed: int, prepared: PreparedD
                     step_idx=train_step,
                     domain_alloc=domain_alloc,
                     stock_allocs=stock_allocs,
+                    domain_to_stocks=window_context.domain_to_stocks,
+                    domain_factor_frames=window_context.domain_factor_frames,
+                    global_feature_df=window_context.global_feature_df,
+                    stock_feature_frames=window_context.stock_feature_frames,
+                    stock_feature_names=window_context.stock_feature_names,
+                    momentum_df=window_context.momentum_df,
+                    volatility_df=window_context.volatility_df,
+                    liquidity_df=window_context.liquidity_df,
                 )
                 did_rebalance = active_train_decision is None or train_hold_remaining <= 0
                 if did_rebalance:
@@ -829,6 +1128,14 @@ def _run_single(config: ProjectConfig, mode: str, seed: int, prepared: PreparedD
                     step_idx=train_step + 1,
                     domain_alloc=next_domain_alloc,
                     stock_allocs=next_stock_allocs,
+                    domain_to_stocks=window_context.domain_to_stocks,
+                    domain_factor_frames=window_context.domain_factor_frames,
+                    global_feature_df=window_context.global_feature_df,
+                    stock_feature_frames=window_context.stock_feature_frames,
+                    stock_feature_names=window_context.stock_feature_names,
+                    momentum_df=window_context.momentum_df,
+                    volatility_df=window_context.volatility_df,
+                    liquidity_df=window_context.liquidity_df,
                 )
                 done = local_idx == len(tr_dates) - 1
                 if did_rebalance:
@@ -872,6 +1179,14 @@ def _run_single(config: ProjectConfig, mode: str, seed: int, prepared: PreparedD
                 step_idx=test_step,
                 domain_alloc=domain_alloc,
                 stock_allocs=stock_allocs,
+                domain_to_stocks=window_context.domain_to_stocks,
+                domain_factor_frames=window_context.domain_factor_frames,
+                global_feature_df=window_context.global_feature_df,
+                stock_feature_frames=window_context.stock_feature_frames,
+                stock_feature_names=window_context.stock_feature_names,
+                momentum_df=window_context.momentum_df,
+                volatility_df=window_context.volatility_df,
+                liquidity_df=window_context.liquidity_df,
             )
             did_rebalance = active_test_decision is None or test_hold_remaining <= 0
             if did_rebalance:
@@ -892,7 +1207,7 @@ def _run_single(config: ProjectConfig, mode: str, seed: int, prepared: PreparedD
             reward_components.append(
                 {"phase": "test", "window": window_idx, "round": -1, "step": test_step, **rb}
             )
-            regime = str(prepared.regimes.loc[date])
+            regime = str(window_context.regimes.loc[date])
             regime_returns.setdefault(regime, []).append(gross)
             domain_alloc = dict(decision.final_domain_weights)
             for domain, action in decision.domain_actions.items():
