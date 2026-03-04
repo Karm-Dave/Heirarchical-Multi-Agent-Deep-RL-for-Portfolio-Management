@@ -57,11 +57,10 @@ def main() -> None:
     print(f"Runs completed: {len(batch.runs)}")
     best = max(batch.runs, key=lambda x: x.test_metrics.cumulative_return)
     print("Best run by test cumulative return:")
-    print(f"  mode={best.mode}, seed={best.seed}, test_cum_return={best.test_metrics.cumulative_return:.6f}")
+    print(f"  method={best.mode}, seed={best.seed}, test_cum_return={best.test_metrics.cumulative_return:.6f}")
     if best.output_dir:
         print(f"  artifacts={best.output_dir}")
 
 
 if __name__ == "__main__":
     main()
-

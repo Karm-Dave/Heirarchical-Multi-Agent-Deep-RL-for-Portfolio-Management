@@ -76,6 +76,8 @@ class DomainRLManager:
         batch_size: int = 64,
         replay_size: int = 20000,
         hold_inertia: float = 0.75,
+        uncertainty_alpha: float = 0.75,
+        n_step: int = 3,
         seed: int = 0,
     ) -> None:
         self.domain_name = domain_name
@@ -104,11 +106,15 @@ class DomainRLManager:
                 min_hold_steps=min_hold_steps,
                 max_hold_steps=max_hold_steps,
                 hold_inertia=hold_inertia,
+                n_step=n_step,
                 seed=seed + i * 31,
             )
             for i in range(self._ensemble_size)
         ]
         self._last_action_vecs: list[np.ndarray] = []
+        self.uncertainty_alpha = float(max(0.0, uncertainty_alpha))
+        self._risk_lambda = 0.25
+        self._risk_blend = 0.5
 
     def _extend_state(self, state: DomainState) -> np.ndarray:
         vector = np.asarray(
@@ -148,6 +154,9 @@ class DomainRLManager:
 
         stock_weights = np.mean(np.stack(weights_list, axis=0), axis=0)
         stock_weights = np.maximum(stock_weights, 1e-8)
+        sigma = np.std(np.stack(weights_list, axis=0), axis=0)
+        stock_weights = stock_weights * np.exp(-self.uncertainty_alpha * np.maximum(0.0, sigma))
+        stock_weights = np.maximum(stock_weights, 1e-8)
         stock_weights = stock_weights / float(np.sum(stock_weights))
         hold = int(round(float(np.mean(holds))))
         hold = min(hold, max(1, parent_hold_steps))
@@ -160,17 +169,23 @@ class DomainRLManager:
         if control is not None:
             hold = min(hold, max(1, control.hold_steps))
 
-            # Top-down risk control: blend RL action with inverse-volatility allocation.
-            inv_vol = {
-                stock: 1.0 / max(1e-4, state.stock_volatility.get(stock, 1.0))
-                for stock in self.stock_names
-            }
-            inv_vol = _normalize(inv_vol)
-            blend = max(0.0, min(1.0, control.risk_budget))
-            stock_weights_map = {
-                stock: (1.0 - blend) * stock_weights_map.get(stock, 0.0) + blend * inv_vol.get(stock, 0.0)
-                for stock in self.stock_names
-            }
+            # Risk-constrained SAC blend via a lightweight Lagrangian penalty.
+            vol_vec = np.asarray(
+                [max(1e-4, float(state.stock_volatility.get(stock, 1.0))) for stock in self.stock_names],
+                dtype=float,
+            )
+            w_vec = np.asarray([float(stock_weights_map.get(stock, 0.0)) for stock in self.stock_names], dtype=float)
+            target_risk = max(1e-5, float(control.risk_budget) * float(np.mean(vol_vec)))
+            realized_risk = float(np.dot(w_vec, vol_vec))
+            violation = realized_risk - target_risk
+            self._risk_lambda = float(max(0.0, min(10.0, self._risk_lambda + 0.05 * violation)))
+            lagrangian_penalty = np.exp(-self._risk_lambda * (vol_vec / max(1e-6, float(np.mean(vol_vec)))))
+            constrained = np.maximum(1e-8, w_vec * lagrangian_penalty)
+            constrained = constrained / float(np.sum(constrained))
+            blend = float(max(0.0, min(1.0, self._risk_blend)))
+            mixed = (1.0 - blend) * w_vec + blend * constrained
+            mixed = mixed / float(np.sum(mixed))
+            stock_weights_map = {stock: float(mixed[i]) for i, stock in enumerate(self.stock_names)}
             stock_weights_map = _cap_weights(stock_weights_map, control.max_stock_weight)
 
         return DomainAction(
@@ -189,6 +204,10 @@ class DomainRLManager:
         done: bool,
     ) -> None:
         del action
+        if reward < 0.0:
+            self._risk_blend = float(min(1.0, self._risk_blend + 0.01))
+        else:
+            self._risk_blend = float(max(0.0, self._risk_blend - 0.005))
         state_vec = self._extend_state(state)
         next_state_vec = self._extend_state(next_state)
         for idx, policy in enumerate(self.policies):

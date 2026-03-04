@@ -31,6 +31,9 @@ def build_top_manager(
     transformer_layers: int = 2,
     transformer_dropout: float = 0.1,
     hold_inertia: float = 0.75,
+    uncertainty_alpha: float = 0.75,
+    router_entropy_coef: float = 0.01,
+    router_load_balance_coef: float = 0.03,
     seed: int = 0,
 ) -> TopManagerBase:
     normalized_mode = mode.strip().lower()
@@ -54,6 +57,7 @@ def build_top_manager(
             transformer_layers=transformer_layers,
             transformer_dropout=transformer_dropout,
             hold_inertia=hold_inertia,
+            uncertainty_alpha=uncertainty_alpha,
             seed=seed,
         )
     if normalized_mode in {"moe", "router", "moe_router"}:
@@ -62,7 +66,9 @@ def build_top_manager(
             max_hold_steps=max_hold_steps,
             num_global_features=num_global_features,
             seed=seed,
-            train_router=False,
+            train_router=True,
+            entropy_coef=router_entropy_coef,
+            load_balance_coef=router_load_balance_coef,
         )
     raise ValueError(f"Unsupported top manager mode: {mode}")
 
@@ -102,6 +108,9 @@ def build_hierarchical_agent(
         transformer_layers=rl.transformer_layers if rl is not None else 2,
         transformer_dropout=rl.transformer_dropout if rl is not None else 0.1,
         hold_inertia=stochastic_control.hold_inertia if stochastic_control is not None else 0.75,
+        uncertainty_alpha=rl.uncertainty_alpha if rl is not None else 0.75,
+        router_entropy_coef=rl.router_entropy_coef if rl is not None else 0.01,
+        router_load_balance_coef=rl.router_load_balance_coef if rl is not None else 0.03,
         seed=seed,
     )
 
@@ -126,6 +135,8 @@ def build_hierarchical_agent(
             batch_size=rl.sac_batch_size if rl is not None else 64,
             replay_size=rl.sac_replay_size if rl is not None else 20000,
             hold_inertia=stochastic_control.hold_inertia if stochastic_control is not None else 0.75,
+            uncertainty_alpha=rl.uncertainty_alpha if rl is not None else 0.75,
+            n_step=rl.sac_n_step if rl is not None else 3,
             seed=seed,
         )
         for domain, stocks in domain_to_stocks.items()

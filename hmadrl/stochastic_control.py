@@ -67,6 +67,9 @@ class StochasticController:
         self._latent_state = {domain: 0.0 for domain in self.domain_names}
         mid_hold = max(1, int(round(self.max_hold_steps * 0.5)))
         self._last_hold = {domain: mid_hold for domain in self.domain_names}
+        self._risk_scale = {domain: 1.0 for domain in self.domain_names}
+        self._blend_coeff = {domain: 0.5 for domain in self.domain_names}
+        self._last_stress = {domain: 0.0 for domain in self.domain_names}
 
     def build_controls(
         self,
@@ -101,6 +104,7 @@ class StochasticController:
             vol_flag = float(max(0.0, global_features.get("regime_volatile", 0.0)))
             market_stress = min(3.0, market_vol + 2.0 * market_dd + bear_flag + 0.5 * vol_flag)
             stress_scale = 1.0 / (1.0 + market_stress)
+            self._last_stress[domain] = float(market_stress)
 
             # Merton fraction proxy for risky allocation intensity.
             merton = mu / (max(1e-4, self.config.risk_aversion) * sigma * sigma)
@@ -123,18 +127,21 @@ class StochasticController:
             self._latent_state[domain] = latent_new
 
             confidence = 1.0 / (1.0 + uncertainty)
+            blend_coeff = float(max(0.0, min(1.0, self._blend_coeff.get(domain, 0.5))))
             control_term = 0.5 * math.tanh(latent_new) + 0.5 * confidence
             budget_score = (
-                base_budgets[domain] * (0.6 + 0.4 * control_term) * (0.65 + 0.35 * stress_scale)
+                base_budgets[domain]
+                * (0.6 + 0.4 * control_term)
+                * (0.65 + 0.35 * stress_scale)
+                * (0.75 + 0.25 * (1.0 - blend_coeff))
                 + 0.1 * prev_alloc
             )
             budget_score = max(0.0, budget_score)
 
-            risk_score = (1.0 / sigma) * (0.5 + 0.5 * stress_scale)
-            hold_score = math.exp(
-                self.config.hold_scale
-                * ((mu / sigma) - self.config.uncertainty_penalty * uncertainty)
-            )
+            risk_scale = float(max(0.25, min(3.0, self._risk_scale.get(domain, 1.0))))
+            risk_score = (1.0 / sigma) * (0.5 + 0.5 * stress_scale) * risk_scale
+            hold_arg = self.config.hold_scale * ((mu / sigma) - self.config.uncertainty_penalty * uncertainty)
+            hold_score = math.exp(float(max(-8.0, min(8.0, hold_arg))))
             proposed_hold = int(round(top_action.hold_steps * hold_score))
             local_max_hold = max(1, min(self.max_hold_steps, top_action.hold_steps))
             min_ratio = max(0.0, min(1.0, self.config.min_hold_ratio))
@@ -189,4 +196,15 @@ class StochasticController:
                 uncertainty=control.uncertainty,
             )
         return controls
+
+    def update_from_reward(self, reward: float) -> None:
+        reward = float(reward)
+        for domain in self.domain_names:
+            stress = float(max(0.0, self._last_stress.get(domain, 0.0)))
+            if reward < 0.0:
+                self._risk_scale[domain] = float(min(3.0, max(0.25, self._risk_scale[domain] + 0.02 * (1.0 + stress))))
+                self._blend_coeff[domain] = float(min(1.0, max(0.0, self._blend_coeff[domain] + 0.015)))
+            else:
+                self._risk_scale[domain] = float(min(3.0, max(0.25, self._risk_scale[domain] - 0.01)))
+                self._blend_coeff[domain] = float(min(1.0, max(0.0, self._blend_coeff[domain] - 0.01)))
 

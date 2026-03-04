@@ -1,6 +1,7 @@
 from pathlib import Path
 import tempfile
 import unittest
+import json
 
 from hmadrl.hierarchy import HierarchicalDecision
 from hmadrl.pipeline import BacktestMetrics, TrainingResult, save_training_result
@@ -80,6 +81,7 @@ class TestPipelineArtifacts(unittest.TestCase):
             train_domain_allocations=[{"tech": 0.6, "finance": 0.4}] * 3,
             test_domain_allocations=[{"tech": 0.5, "finance": 0.5}] * 2,
             last_decision=decision,
+            evaluation_extras={"newey_west_t_stat": 1.0},
         )
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -93,8 +95,9 @@ class TestPipelineArtifacts(unittest.TestCase):
             self.assertTrue((out / "drawdown_curve.png").exists())
             self.assertTrue((out / "train_domain_allocation.png").exists())
             self.assertTrue((out / "test_domain_allocation.png").exists())
+            summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+            self.assertIn("evaluation_extras", summary)
 
 
 if __name__ == "__main__":
     unittest.main()
-

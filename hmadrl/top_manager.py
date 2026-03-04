@@ -45,6 +45,7 @@ class RLTopManager(TopManagerBase):
         transformer_layers: int = 2,
         transformer_dropout: float = 0.1,
         hold_inertia: float = 0.75,
+        uncertainty_alpha: float = 0.75,
         seed: int = 0,
     ) -> None:
         self.domain_names = list(domain_names)
@@ -78,6 +79,7 @@ class RLTopManager(TopManagerBase):
         self._last_action_vecs: list[np.ndarray] = []
         self._last_logprobs: list[float] = []
         self._last_values: list[float] = []
+        self.uncertainty_alpha = float(max(0.0, uncertainty_alpha))
 
     def _extend_state(self, state: TopLevelState) -> np.ndarray:
         vector = np.asarray(state.to_vector(self.domain_names), dtype=np.float32)
@@ -112,7 +114,10 @@ class RLTopManager(TopManagerBase):
 
         avg_weights = np.mean(np.stack(weights_list, axis=0), axis=0)
         avg_weights = np.maximum(avg_weights, 1e-8)
-        avg_weights = avg_weights / float(np.sum(avg_weights))
+        sigma = np.std(np.stack(weights_list, axis=0), axis=0)
+        adjusted = avg_weights * np.exp(-self.uncertainty_alpha * np.maximum(0.0, sigma))
+        adjusted = np.maximum(adjusted, 1e-8)
+        avg_weights = adjusted / float(np.sum(adjusted))
         hold_steps = int(round(float(np.mean(holds))))
         uncertainty = float(np.std(np.stack(weights_list, axis=0), axis=0).mean() + np.mean(entropies))
 
@@ -178,12 +183,16 @@ class MoERouterTopManager(TopManagerBase):
         max_hold_steps: int,
         num_global_features: int = 0,
         seed: int = 0,
-        train_router: bool = False,
+        train_router: bool = True,
+        entropy_coef: float = 0.01,
+        load_balance_coef: float = 0.03,
     ) -> None:
         self.domain_names = list(domain_names)
         self.max_hold_steps = max_hold_steps
         self.rng = random.Random(seed)
         self.train_router = train_router
+        self.entropy_coef = float(max(0.0, entropy_coef))
+        self.load_balance_coef = float(max(0.0, load_balance_coef))
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         state_dim = TopLevelState.vector_size(len(self.domain_names), num_global_features=num_global_features)
@@ -191,6 +200,9 @@ class MoERouterTopManager(TopManagerBase):
         self.optimizer = torch.optim.Adam(self.router.parameters(), lr=1e-3)
 
         self._last_logprob: torch.Tensor | None = None
+        self._last_probs: torch.Tensor | None = None
+        self._last_expert: int | None = None
+        self._expert_counts = torch.zeros(3, dtype=torch.float32, device=self.device)
         self.experts: list[Callable[[TopLevelState], tuple[dict[str, float], int]]] = [
             self._momentum_expert,
             self._low_vol_expert,
@@ -214,6 +226,9 @@ class MoERouterTopManager(TopManagerBase):
         weights, hold_steps = self.experts[expert_index](state)
         hold_steps = max(1, min(hold_steps, self.max_hold_steps))
         self._last_logprob = torch.log(probs[expert_index] + 1e-8)
+        self._last_probs = probs
+        self._last_expert = expert_index
+        self._expert_counts[expert_index] += 1.0
 
         return TopLevelAction(
             domain_weights=weights,
@@ -223,20 +238,31 @@ class MoERouterTopManager(TopManagerBase):
         ).normalized()
 
     def update_router(self, reward: float) -> None:
-        if not self.train_router or self._last_logprob is None:
+        if not self.train_router or self._last_logprob is None or self._last_probs is None:
             return
-        loss = -float(reward) * self._last_logprob
+        entropy = -torch.sum(self._last_probs * torch.log(self._last_probs + 1e-8))
+        target = torch.full_like(self._last_probs, 1.0 / float(self._last_probs.numel()))
+        instant_balance = torch.mean((self._last_probs - target) ** 2)
+        counts = self._expert_counts / torch.clamp(self._expert_counts.sum(), min=1.0)
+        count_balance = torch.mean((counts - target.detach()) ** 2)
+        loss = (
+            -float(reward) * self._last_logprob
+            - self.entropy_coef * entropy
+            + self.load_balance_coef * (instant_balance + count_balance)
+        )
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
         self._last_logprob = None
+        self._last_probs = None
+        self._last_expert = None
 
     def _momentum_expert(self, state: TopLevelState) -> tuple[dict[str, float], int]:
         raw = np.array([state.domain_momentum.get(d, 0.0) for d in self.domain_names], dtype=float)
         shifted = raw - raw.min() + 1e-4
         probs = shifted / shifted.sum() if shifted.sum() > 0 else np.ones_like(shifted) / len(shifted)
         weights = {d: float(probs[i]) for i, d in enumerate(self.domain_names)}
-        hold = min(self.max_hold_steps, max(2, self.max_hold_steps))
+        hold = max(1, min(self.max_hold_steps, int(round(0.75 * self.max_hold_steps))))
         return weights, hold
 
     def _low_vol_expert(self, state: TopLevelState) -> tuple[dict[str, float], int]:

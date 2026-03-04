@@ -22,8 +22,8 @@ class TestFactory(unittest.TestCase):
             seed=7,
         )
         self.assertIsInstance(manager, MoERouterTopManager)
+        self.assertTrue(manager.train_router)
 
 
 if __name__ == "__main__":
     unittest.main()
-

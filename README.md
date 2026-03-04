@@ -20,8 +20,25 @@ The project is designed for experimentation and reproducible research with modul
    - top domain weights + hold horizon
    - per-domain stock weights + hold horizon
 5. Applies stochastic control mediation (`capital_budget`, `risk_budget`, caps, hold constraints).
-6. Runs walk-forward train/test windows with cost-aware rewards.
+6. Runs leakage-safe walk-forward train/test windows with:
+   - rolling adaptive clustering fit on train windows only
+   - train-window-only normalization (including regime-conditional scaling)
+   - lagged macro/global features
 7. Saves metrics, CSVs, plots, and summaries to `results/`.
+
+## Methods In Main Pipeline
+
+The batch runner now executes method-level experiments (each saved under its own subfolder):
+
+- Hierarchical: `rl`, `moe_router`
+- Baselines: `equal_weight`, `risk_parity`, `hrp`, `flat_ppo`, `flat_sac`, `lstm_portfolio`, `transformer_portfolio`
+- Ablations:
+  - `ablation_no_learned_clusters`
+  - `ablation_no_stochastic_control`
+  - `ablation_no_hold_enforcement`
+  - `ablation_no_global_macro`
+  - `ablation_no_liquidity`
+  - `ablation_static_sectors`
 
 ## Architecture
 
@@ -131,6 +148,13 @@ Per-run artifacts:
 - `losses.csv` (if available)
 - `reward_components.csv`
 - `walk_forward_windows.csv`
+- evaluation extras in `summary.json`:
+  - Newey-West t-stat
+  - Deflated Sharpe estimate
+  - Bootstrap confidence intervals
+  - Crisis subperiod metrics
+  - Turnover decomposition
+  - Capacity/liquidity scaling analysis
 - plots: reward, equity, drawdown, allocation, regime returns
 
 ## Branch Notes

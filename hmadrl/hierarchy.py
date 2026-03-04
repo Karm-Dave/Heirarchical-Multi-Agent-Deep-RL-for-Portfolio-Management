@@ -21,6 +21,26 @@ def _normalize(weights: Mapping[str, float]) -> dict[str, float]:
     return {k: max(0.0, v) / total for k, v in weights.items()}
 
 
+def _vol_target_weights(
+    weights: Mapping[str, float],
+    stock_volatility: Mapping[str, float],
+    target_vol: float,
+) -> dict[str, float]:
+    out = _normalize(weights)
+    if not out:
+        return {}
+    target = max(1e-4, float(target_vol))
+    realized = 0.0
+    for key, w in out.items():
+        realized += float(w) * max(1e-4, float(stock_volatility.get(key, 0.2)))
+    if realized <= target:
+        return out
+    scale = max(0.0, min(1.0, target / realized))
+    equal = 1.0 / len(out)
+    blended = {k: scale * float(v) + (1.0 - scale) * equal for k, v in out.items()}
+    return _normalize(blended)
+
+
 @dataclass(frozen=True)
 class HierarchicalDecision:
     top_action: TopLevelAction
@@ -40,10 +60,12 @@ class HierarchicalPortfolioAgent:
         top_manager: TopManagerBase,
         domain_managers: Mapping[str, DomainRLManager],
         stochastic_controller: StochasticController | None = None,
+        target_portfolio_vol: float = 0.2,
     ) -> None:
         self.top_manager = top_manager
         self.domain_managers = dict(domain_managers)
         self.stochastic_controller = stochastic_controller
+        self.target_portfolio_vol = float(max(1e-4, target_portfolio_vol))
 
     def decide(
         self,
@@ -96,6 +118,13 @@ class HierarchicalPortfolioAgent:
 
         final_domain_weights = _normalize(final_domain_weights)
         final_stock_weights = _normalize(final_stock_weights)
+        stock_vol_map: dict[str, float] = {}
+        for domain, state in domain_states.items():
+            for stock, vol in state.stock_volatility.items():
+                stock_vol_map[f"{domain}:{stock}"] = float(max(1e-4, vol))
+        market_vol = float((top_state.global_features or {}).get("market_vol", self.target_portfolio_vol))
+        dynamic_target = max(0.05, min(0.6, market_vol if market_vol > 0.0 else self.target_portfolio_vol))
+        final_stock_weights = _vol_target_weights(final_stock_weights, stock_vol_map, dynamic_target)
         return HierarchicalDecision(
             top_action=top_action,
             domain_controls=controls,

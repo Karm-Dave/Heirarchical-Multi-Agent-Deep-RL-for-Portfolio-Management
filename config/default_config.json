@@ -39,7 +39,11 @@
     "sac_target_entropy": -2.0,
     "sac_use_dueling": true,
     "sac_batch_size": 256,
-    "sac_replay_size": 200000
+    "sac_replay_size": 200000,
+    "sac_n_step": 3,
+    "uncertainty_alpha": 0.75,
+    "router_entropy_coef": 0.01,
+    "router_load_balance_coef": 0.03
   },
   "data": {
     "start_date": "2010-01-01",
@@ -74,7 +78,11 @@
     "downside_penalty": 2.0,
     "cvar_alpha": 0.1,
     "cvar_penalty": 1.5,
-    "reward_window": 60
+    "reward_window": 60,
+    "rank_loss_coef": 0.05,
+    "domain_entropy_coef": 0.02,
+    "hold_penalty_coef": 0.01,
+    "max_reasonable_hold": 8
   },
   "stochastic_control": {
     "risk_aversion": 3.0,
@@ -89,6 +97,23 @@
   "experiments": {
     "results_dir": "results",
     "run_name": "hmadrl_continuous_batch",
+    "methods": [
+      "rl",
+      "moe_router",
+      "equal_weight",
+      "risk_parity",
+      "hrp",
+      "flat_ppo",
+      "flat_sac",
+      "lstm_portfolio",
+      "transformer_portfolio",
+      "ablation_no_learned_clusters",
+      "ablation_no_stochastic_control",
+      "ablation_no_hold_enforcement",
+      "ablation_no_global_macro",
+      "ablation_no_liquidity",
+      "ablation_static_sectors"
+    ],
     "modes": ["rl", "moe_router"],
     "seeds": [42, 84, 126, 256, 512],
     "fine_tune_rounds": 5

@@ -20,7 +20,9 @@ from .config import ProjectConfig, RewardConfig, load_config
 from .data_api import AutoMarketDataProvider, StooqProvider, YFinanceProvider
 from .factory import build_hierarchical_agent
 from .hierarchy import HierarchicalDecision, HierarchicalPortfolioAgent
-from .spaces import DomainState, TopLevelState
+from .rl_core import PPOContinuousPolicy, SACContinuousPolicy
+from .spaces import DomainAction, DomainState, TopLevelAction, TopLevelState
+from .stochastic_control import DomainControlSignal
 
 
 @dataclass(frozen=True)
@@ -55,6 +57,7 @@ class TrainingResult:
     reward_components: list[dict[str, float | str | int]] = field(default_factory=list)
     walk_forward_windows: list[dict[str, Any]] = field(default_factory=list)
     regime_metrics: dict[str, dict[str, float | int]] = field(default_factory=dict)
+    evaluation_extras: dict[str, Any] = field(default_factory=dict)
     output_dir: str | None = None
 
 
@@ -63,6 +66,19 @@ class BatchResult:
     provider: str
     batch_dir: str
     runs: list[TrainingResult]
+
+
+@dataclass(frozen=True)
+class MethodSpec:
+    method_id: str
+    family: str  # "hierarchical" | "baseline"
+    top_mode: str = "rl"
+    baseline_kind: str = ""
+    use_learned_clusters: bool = True
+    use_stochastic_control: bool = True
+    enforce_hold: bool = True
+    use_global_macro_features: bool = True
+    use_liquidity_features: bool = True
 
 
 @dataclass(frozen=True)
@@ -756,6 +772,38 @@ def _portfolio_return(decision: HierarchicalDecision, next_row: pd.Series) -> fl
     return float(value)
 
 
+def _domain_step_rewards(decision: HierarchicalDecision, next_row: pd.Series) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for domain, action in decision.domain_actions.items():
+        domain_ret = 0.0
+        for stock, weight in action.stock_weights.items():
+            domain_ret += float(weight) * float(next_row.get(stock, 0.0))
+        out[domain] = float(domain_ret)
+    return out
+
+
+def _rank_loss(final_stock_weights: Mapping[str, float], next_row: pd.Series) -> float:
+    if not final_stock_weights:
+        return 0.0
+    weights_by_stock: dict[str, float] = {}
+    for key, weight in final_stock_weights.items():
+        stock = str(key).split(":", 1)[-1]
+        weights_by_stock[stock] = weights_by_stock.get(stock, 0.0) + float(weight)
+    if len(weights_by_stock) < 2:
+        return 0.0
+    stocks = sorted(weights_by_stock.keys())
+    w = pd.Series([weights_by_stock[s] for s in stocks], index=stocks, dtype=float)
+    r = pd.Series([float(next_row.get(s, 0.0)) for s in stocks], index=stocks, dtype=float)
+    w_rank = w.rank(pct=True, method="average")
+    r_rank = r.rank(pct=True, method="average")
+    if float(w_rank.std(ddof=0)) < 1e-12 or float(r_rank.std(ddof=0)) < 1e-12:
+        return 0.0
+    corr = float(np.corrcoef(w_rank.to_numpy(dtype=float), r_rank.to_numpy(dtype=float))[0, 1])
+    if not np.isfinite(corr):
+        corr = 0.0
+    return float(max(0.0, 1.0 - corr))
+
+
 def _turnover(prev_w: Mapping[str, float], new_w: Mapping[str, float]) -> float:
     def _aggregate(weights: Mapping[str, float]) -> dict[str, float]:
         out: dict[str, float] = {}
@@ -790,6 +838,9 @@ def _reward(
     new_w: Mapping[str, float],
     hist: list[float],
     cfg: RewardConfig,
+    rank_loss: float = 0.0,
+    domain_entropy_bonus: float = 0.0,
+    hold_penalty: float = 0.0,
 ) -> dict[str, float]:
     t = _turnover(prev_w, new_w)
     tx = t * (cfg.transaction_cost_bps / 10000.0)
@@ -799,7 +850,13 @@ def _reward(
     win = (hist + [gross])[-max(5, int(cfg.reward_window)) :]
     cvar = _compute_cvar(win, cfg.cvar_alpha)
     cp = cfg.cvar_penalty * max(0.0, -cvar)
-    r = gross - tx - sl - tp - down - cp
+    cost_norm = (tx + sl + tp) / (1.0 + abs(gross))
+    cvar_norm = max(0.0, -cvar) / (1.0 + abs(cvar))
+    turnover_norm = t / (1.0 + t)
+    rank_penalty = cfg.rank_loss_coef * max(0.0, float(rank_loss))
+    hold_cost = cfg.hold_penalty_coef * max(0.0, float(hold_penalty))
+    entropy_bonus = cfg.domain_entropy_coef * max(0.0, float(domain_entropy_bonus))
+    r = gross - cost_norm - down - cvar_norm - turnover_norm - rank_penalty - hold_cost + entropy_bonus
     return {
         "gross_return": float(gross),
         "turnover": float(t),
@@ -809,6 +866,10 @@ def _reward(
         "downside_penalty": float(down),
         "cvar": float(cvar),
         "cvar_penalty": float(cp),
+        "rank_loss": float(rank_loss),
+        "rank_penalty": float(rank_penalty),
+        "domain_entropy_bonus": float(entropy_bonus),
+        "hold_penalty": float(hold_cost),
         "reward": float(r),
     }
 
@@ -822,6 +883,7 @@ def _train_step(
     decision: HierarchicalDecision,
     reward: float,
     done: bool,
+    domain_rewards: Mapping[str, float] | None = None,
 ) -> dict[str, float]:
     losses: dict[str, float] = {}
     top = agent.top_manager
@@ -833,9 +895,12 @@ def _train_step(
             losses["top"] = float(top_loss)
     if hasattr(top, "update_router"):
         top.update_router(reward)
+    if agent.stochastic_controller is not None and hasattr(agent.stochastic_controller, "update_from_reward"):
+        agent.stochastic_controller.update_from_reward(reward)
     for domain, action in decision.domain_actions.items():
         manager = agent.domain_managers[domain]
-        manager.remember(domain_states[domain], action, reward, next_domain_states[domain], done)
+        d_reward = float(domain_rewards.get(domain, reward)) if domain_rewards is not None else float(reward)
+        manager.remember(domain_states[domain], action, d_reward, next_domain_states[domain], done)
         dloss = manager.learn()
         if dloss is not None:
             losses[f"domain:{domain}"] = float(dloss)
@@ -870,6 +935,139 @@ def _metrics_dict(m: BacktestMetrics) -> dict[str, float | int]:
         "max_drawdown": m.max_drawdown,
         "downside_deviation": m.downside_deviation,
         "cvar": m.cvar,
+    }
+
+
+def _newey_west_t(values: list[float], lags: int = 5) -> float:
+    if len(values) < 8:
+        return 0.0
+    arr = np.asarray(values, dtype=float)
+    mu = float(np.mean(arr))
+    resid = arr - mu
+    max_lag = max(1, min(int(lags), len(arr) - 1))
+    gamma0 = float(np.dot(resid, resid) / len(arr))
+    var = gamma0
+    for lag in range(1, max_lag + 1):
+        cov = float(np.dot(resid[lag:], resid[:-lag]) / len(arr))
+        weight = 1.0 - lag / (max_lag + 1.0)
+        var += 2.0 * weight * cov
+    se = math.sqrt(max(1e-12, var / len(arr)))
+    return float(mu / se)
+
+
+def _deflated_sharpe(values: list[float], num_trials: int) -> float:
+    if len(values) < 8:
+        return 0.0
+    arr = np.asarray(values, dtype=float)
+    period_sharpe = float(np.mean(arr) / (np.std(arr, ddof=0) + 1e-12) * np.sqrt(252.0))
+    max_ref = math.sqrt(2.0 * math.log(max(2, int(num_trials)))) / math.sqrt(len(arr))
+    return float(period_sharpe - max_ref)
+
+
+def _bootstrap_ci(
+    values: list[float],
+    stat_fn: Any,
+    n_boot: int = 400,
+    seed: int = 7,
+) -> tuple[float, float]:
+    if len(values) < 5:
+        s = float(stat_fn(values)) if values else 0.0
+        return s, s
+    rng = np.random.default_rng(seed)
+    arr = np.asarray(values, dtype=float)
+    stats = []
+    for _ in range(max(50, int(n_boot))):
+        sample = arr[rng.integers(0, len(arr), size=len(arr))]
+        stats.append(float(stat_fn(sample.tolist())))
+    lo = float(np.quantile(stats, 0.025))
+    hi = float(np.quantile(stats, 0.975))
+    return lo, hi
+
+
+def _crisis_metrics(dates: list[str], values: list[float], cvar_alpha: float) -> dict[str, dict[str, float | int]]:
+    if not dates or not values:
+        return {}
+    idx = pd.to_datetime(pd.Series(dates)).dt.date
+    ret = pd.Series(values, index=idx, dtype=float)
+    windows = [
+        ("covid_crash_2020", pd.Timestamp("2020-02-15").date(), pd.Timestamp("2020-06-30").date()),
+        ("inflation_shock_2022", pd.Timestamp("2022-01-01").date(), pd.Timestamp("2022-12-31").date()),
+        ("regional_bank_stress_2023", pd.Timestamp("2023-03-01").date(), pd.Timestamp("2023-06-30").date()),
+    ]
+    out: dict[str, dict[str, float | int]] = {}
+    for name, start, end in windows:
+        sub = ret.loc[(ret.index >= start) & (ret.index <= end)]
+        if sub.empty:
+            continue
+        out[name] = _metrics_dict(_metrics(sub.tolist(), cvar_alpha))
+    return out
+
+
+def _turnover_decomposition(components: list[dict[str, float | str | int]]) -> dict[str, float]:
+    if not components:
+        return {}
+    frame = pd.DataFrame(components)
+    if frame.empty or "turnover" not in frame.columns:
+        return {}
+    frame["rebalance"] = frame.get("rebalance", 0).fillna(0).astype(int)
+    out = {
+        "mean_turnover_all": float(frame["turnover"].mean()),
+        "mean_turnover_rebalance": float(frame.loc[frame["rebalance"] == 1, "turnover"].mean())
+        if not frame.loc[frame["rebalance"] == 1].empty
+        else 0.0,
+        "mean_turnover_hold": float(frame.loc[frame["rebalance"] == 0, "turnover"].mean())
+        if not frame.loc[frame["rebalance"] == 0].empty
+        else 0.0,
+    }
+    return out
+
+
+def _capacity_liquidity_analysis(
+    test_dates: list[str],
+    test_returns: list[float],
+    liquidity_df: pd.DataFrame,
+    cvar_alpha: float,
+) -> dict[str, dict[str, float | int]]:
+    if not test_dates or not test_returns or liquidity_df.empty:
+        return {}
+    idx = pd.to_datetime(pd.Series(test_dates))
+    liq = liquidity_df.reindex(idx).mean(axis=1).fillna(liquidity_df.mean(axis=1).mean())
+    out: dict[str, dict[str, float | int]] = {}
+    base = np.asarray(test_returns, dtype=float)
+    for scale in [1.0, 5.0, 10.0]:
+        impact = scale * 1e-5 / (liq.to_numpy(dtype=float) + 1e-6)
+        adjusted = (base - impact).tolist()
+        out[f"capacity_x{int(scale)}"] = _metrics_dict(_metrics(adjusted, cvar_alpha))
+    return out
+
+
+def _evaluation_extras(
+    method_count: int,
+    test_dates: list[str],
+    test_returns: list[float],
+    reward_components: list[dict[str, float | str | int]],
+    liquidity_df: pd.DataFrame,
+    cvar_alpha: float,
+) -> dict[str, Any]:
+    sharpe_stat = lambda vals: _metrics(vals, cvar_alpha).sharpe
+    cum_stat = lambda vals: _metrics(vals, cvar_alpha).cumulative_return
+    sharpe_ci = _bootstrap_ci(test_returns, sharpe_stat, n_boot=300, seed=17)
+    cum_ci = _bootstrap_ci(test_returns, cum_stat, n_boot=300, seed=19)
+    return {
+        "newey_west_t_stat": _newey_west_t(test_returns, lags=5),
+        "deflated_sharpe_ratio": _deflated_sharpe(test_returns, num_trials=max(1, method_count)),
+        "bootstrap_ci": {
+            "sharpe_95": [float(sharpe_ci[0]), float(sharpe_ci[1])],
+            "cumulative_return_95": [float(cum_ci[0]), float(cum_ci[1])],
+        },
+        "crisis_subperiods": _crisis_metrics(test_dates, test_returns, cvar_alpha),
+        "turnover_decomposition": _turnover_decomposition(reward_components),
+        "capacity_liquidity_scaling": _capacity_liquidity_analysis(
+            test_dates=test_dates,
+            test_returns=test_returns,
+            liquidity_df=liquidity_df,
+            cvar_alpha=cvar_alpha,
+        ),
     }
 
 
@@ -909,6 +1107,74 @@ def _walk_splits(config: ProjectConfig, dates: list[pd.Timestamp]) -> list[tuple
     return [(dates[:idx], dates[idx:], 0)]
 
 
+def _method_from_name(method_id: str, config: ProjectConfig) -> MethodSpec:
+    key = str(method_id).strip().lower()
+    if key in {"rl", "hmadrl"}:
+        return MethodSpec(method_id=key, family="hierarchical", top_mode="rl")
+    if key in {"moe_router", "moe"}:
+        return MethodSpec(method_id="moe_router", family="hierarchical", top_mode="moe_router")
+
+    if key in {
+        "equal_weight",
+        "risk_parity",
+        "hrp",
+        "flat_ppo",
+        "flat_sac",
+        "lstm_portfolio",
+        "transformer_portfolio",
+    }:
+        return MethodSpec(method_id=key, family="baseline", baseline_kind=key)
+
+    if key == "ablation_no_learned_clusters":
+        return MethodSpec(
+            method_id=key,
+            family="hierarchical",
+            top_mode="rl",
+            use_learned_clusters=False,
+        )
+    if key == "ablation_no_stochastic_control":
+        return MethodSpec(
+            method_id=key,
+            family="hierarchical",
+            top_mode="rl",
+            use_stochastic_control=False,
+        )
+    if key == "ablation_no_hold_enforcement":
+        return MethodSpec(
+            method_id=key,
+            family="hierarchical",
+            top_mode="rl",
+            enforce_hold=False,
+        )
+    if key == "ablation_no_global_macro":
+        return MethodSpec(
+            method_id=key,
+            family="hierarchical",
+            top_mode="rl",
+            use_global_macro_features=False,
+        )
+    if key == "ablation_no_liquidity":
+        return MethodSpec(
+            method_id=key,
+            family="hierarchical",
+            top_mode="rl",
+            use_liquidity_features=False,
+        )
+    if key in {"ablation_static_sectors", "static_sectors"}:
+        return MethodSpec(
+            method_id="ablation_static_sectors",
+            family="hierarchical",
+            top_mode="rl",
+            use_learned_clusters=False,
+        )
+    return MethodSpec(method_id=key, family="hierarchical", top_mode=str(config.top_mode).lower() or "rl")
+
+
+def _all_stocks(prepared: PreparedData) -> list[str]:
+    stocks = sorted({s for symbols in prepared.domain_to_stocks.values() for s in symbols})
+    return [s for s in stocks if s in prepared.next_returns_df.columns]
+
+
 @dataclass(frozen=True)
 class WindowFeatureContext:
     domain_to_stocks: dict[str, list[str]]
@@ -926,13 +1192,14 @@ def _resolve_window_domain_map(
     config: ProjectConfig,
     prepared: PreparedData,
     train_dates: list[pd.Timestamp],
+    use_learned_clusters: bool,
 ) -> dict[str, list[str]]:
     static_map = {
         str(name): [s for s in symbols if s in prepared.returns_df.columns]
         for name, symbols in config.domain_to_stocks.items()
     }
     static_map = {name: symbols for name, symbols in static_map.items() if symbols}
-    if not config.data.use_learned_clusters:
+    if not config.data.use_learned_clusters or not use_learned_clusters:
         return static_map
     train_returns = prepared.returns_df.loc[pd.Index(train_dates)]
     learned = _learned_cluster_map(
@@ -997,7 +1264,557 @@ def _build_window_context(
     )
 
 
+def _normalize_map(weights: Mapping[str, float]) -> dict[str, float]:
+    cleaned = {str(k): max(0.0, float(v)) for k, v in weights.items()}
+    total = sum(cleaned.values())
+    if total <= 0.0:
+        if not cleaned:
+            return {}
+        equal = 1.0 / len(cleaned)
+        return {k: equal for k in cleaned}
+    return {k: v / total for k, v in cleaned.items()}
+
+
+def _softmax_map(scores: Mapping[str, float], temperature: float = 1.0) -> dict[str, float]:
+    if not scores:
+        return {}
+    keys = list(scores.keys())
+    vals = np.array([float(scores[k]) for k in keys], dtype=float)
+    vals = vals / max(1e-6, float(temperature))
+    vals = vals - float(np.max(vals))
+    ex = np.exp(vals)
+    denom = float(np.sum(ex))
+    if denom <= 0.0 or not np.isfinite(denom):
+        equal = 1.0 / len(keys)
+        return {k: equal for k in keys}
+    return {k: float(ex[i] / denom) for i, k in enumerate(keys)}
+
+
+def _flat_state_vector(
+    date: pd.Timestamp,
+    stocks: list[str],
+    current_alloc: Mapping[str, float],
+    context: WindowFeatureContext,
+    include_global_features: bool = True,
+    include_liquidity_features: bool = True,
+) -> np.ndarray:
+    feature_subset = [name for name in context.stock_feature_names if name in {"mom_20d", "mom_60d", "vol_30d"}]
+    vec: list[float] = []
+    for stock in stocks:
+        vec.append(float(context.momentum_df.at[date, stock]))
+        vec.append(float(context.volatility_df.at[date, stock]))
+        vec.append(float(context.liquidity_df.at[date, stock]) if include_liquidity_features else 0.0)
+        vec.append(float(current_alloc.get(stock, 0.0)))
+        for feature_name in feature_subset:
+            value = float(context.stock_feature_frames[feature_name].at[date, stock])
+            if not include_liquidity_features and "liq" in feature_name.lower():
+                value = 0.0
+            vec.append(value)
+    if include_global_features:
+        for key in sorted(context.global_feature_df.columns):
+            vec.append(float(context.global_feature_df.at[date, key]))
+    return np.asarray(vec, dtype=np.float32)
+
+
+def _cluster_variance(cov: np.ndarray, idx: list[int]) -> float:
+    sub = cov[np.ix_(idx, idx)]
+    diag = np.diag(sub).copy()
+    diag = np.where(diag <= 1e-10, 1e-10, diag)
+    inv_diag = 1.0 / diag
+    w = inv_diag / np.sum(inv_diag)
+    return float(w @ sub @ w)
+
+
+def _hrp_weights(train_returns: pd.DataFrame) -> dict[str, float]:
+    if train_returns.empty:
+        return {}
+    cols = list(train_returns.columns)
+    cov = train_returns.cov().fillna(0.0).to_numpy(dtype=float)
+    corr = train_returns.corr().fillna(0.0).to_numpy(dtype=float)
+    np.fill_diagonal(corr, 1.0)
+    dist = 1.0 - corr
+
+    order = [0]
+    remaining = set(range(1, len(cols)))
+    while remaining:
+        last = order[-1]
+        nxt = min(remaining, key=lambda j: float(dist[last, j]))
+        order.append(int(nxt))
+        remaining.remove(nxt)
+
+    weights = np.ones(len(cols), dtype=float)
+    clusters: list[list[int]] = [order]
+    while clusters:
+        cluster = clusters.pop(0)
+        if len(cluster) <= 1:
+            continue
+        split = len(cluster) // 2
+        left = cluster[:split]
+        right = cluster[split:]
+        var_left = _cluster_variance(cov, left)
+        var_right = _cluster_variance(cov, right)
+        alpha = 0.5 if (var_left + var_right) <= 1e-12 else 1.0 - var_left / (var_left + var_right)
+        weights[left] *= alpha
+        weights[right] *= (1.0 - alpha)
+        clusters.append(left)
+        clusters.append(right)
+    out = {cols[i]: float(max(0.0, weights[i])) for i in range(len(cols))}
+    return _normalize_map(out)
+
+
+def _deterministic_baseline_action(
+    kind: str,
+    date: pd.Timestamp,
+    stocks: list[str],
+    train_dates: list[pd.Timestamp],
+    context: WindowFeatureContext,
+    cache: dict[str, Any],
+    max_hold_steps: int,
+) -> tuple[dict[str, float], int, float]:
+    if kind == "equal_weight":
+        equal = 1.0 / len(stocks)
+        return ({s: equal for s in stocks}, 1, 0.0)
+
+    if kind == "risk_parity":
+        inv_vol = {
+            s: 1.0 / max(1e-6, abs(float(context.volatility_df.at[date, s])))
+            for s in stocks
+        }
+        return (_normalize_map(inv_vol), 2, 0.0)
+
+    if kind == "hrp":
+        if "hrp_weights" not in cache:
+            train_ret = context.momentum_df.loc[pd.Index(train_dates), stocks].diff().fillna(0.0)
+            cache["hrp_weights"] = _hrp_weights(train_ret)
+        return (_normalize_map(cache.get("hrp_weights", {})), 3, 0.0)
+
+    if kind == "lstm_portfolio":
+        mom_20 = context.stock_feature_frames.get("mom_20d", context.momentum_df).loc[date, stocks]
+        mom_60 = context.stock_feature_frames.get("mom_60d", context.momentum_df).loc[date, stocks]
+        score = {s: float(0.7 * mom_20[s] + 0.3 * mom_60[s]) for s in stocks}
+        return (_softmax_map(score, temperature=0.35), 2, 0.0)
+
+    if kind == "transformer_portfolio":
+        if "corr_penalty" not in cache:
+            train_ret = context.momentum_df.loc[pd.Index(train_dates), stocks].diff().fillna(0.0)
+            corr = train_ret.corr().fillna(0.0)
+            cache["corr_penalty"] = corr.abs().mean(axis=1).to_dict()
+        mom = context.stock_feature_frames.get("relative_strength_vs_market_20d", context.momentum_df).loc[date, stocks]
+        liq = context.liquidity_df.loc[date, stocks]
+        score = {
+            s: float(0.65 * mom[s] + 0.25 * liq[s] - 0.4 * float(cache["corr_penalty"].get(s, 0.0)))
+            for s in stocks
+        }
+        return (_softmax_map(score, temperature=0.45), max(1, max_hold_steps // 2), 0.0)
+
+    equal = 1.0 / len(stocks)
+    return ({s: equal for s in stocks}, 1, 0.0)
+
+
+def _flat_decision(
+    method_id: str,
+    stock_weights: Mapping[str, float],
+    hold_steps: int,
+    uncertainty: float = 0.0,
+) -> HierarchicalDecision:
+    domain_action = DomainAction(
+        stock_weights=_normalize_map(stock_weights),
+        hold_steps=max(1, int(hold_steps)),
+        action_id=f"{method_id}_flat_domain",
+        uncertainty=float(max(0.0, uncertainty)),
+    ).normalized()
+    top_action = TopLevelAction(
+        domain_weights={"flat": 1.0},
+        hold_steps=max(1, int(hold_steps)),
+        action_id=f"{method_id}_flat_top",
+        uncertainty=float(max(0.0, uncertainty)),
+    ).normalized()
+    final_stock = {f"flat:{stock}": float(weight) for stock, weight in domain_action.stock_weights.items()}
+    control = DomainControlSignal(
+        capital_budget=1.0,
+        risk_budget=1.0,
+        max_stock_weight=1.0,
+        hold_steps=domain_action.hold_steps,
+        merton_fraction=0.0,
+        uncertainty=float(max(0.0, uncertainty)),
+    )
+    return HierarchicalDecision(
+        top_action=top_action,
+        domain_controls={"flat": control},
+        final_domain_weights={"flat": 1.0},
+        domain_actions={"flat": domain_action},
+        final_stock_weights=final_stock,
+        domain_rebalance_after_steps=top_action.hold_steps,
+        stock_rebalance_after_steps={"flat": domain_action.hold_steps},
+    )
+
+
+def _run_baseline_single(
+    config: ProjectConfig,
+    spec: MethodSpec,
+    seed: int,
+    prepared: PreparedData,
+) -> TrainingResult:
+    stocks = _all_stocks(prepared)
+    if not stocks:
+        raise ValueError("No stocks available for baseline method")
+
+    splits = _walk_splits(config, prepared.valid_dates)
+    train_rewards: list[float] = []
+    train_returns: list[float] = []
+    test_returns: list[float] = []
+    losses: list[dict[str, float]] = []
+    reward_components: list[dict[str, float | str | int]] = []
+    train_domain_allocs: list[dict[str, float]] = []
+    test_domain_allocs: list[dict[str, float]] = []
+    train_dates: list[str] = []
+    test_dates: list[str] = []
+    walk: list[dict[str, Any]] = []
+    regime_returns: dict[str, list[float]] = {}
+    last_decision: HierarchicalDecision | None = None
+    train_step = 0
+    test_step = 0
+
+    print(
+        f"[run] mode={spec.method_id} seed={seed} windows={len(splits)} baseline={spec.baseline_kind}",
+        flush=True,
+    )
+
+    for window_idx, (tr_dates, te_dates, _start) in enumerate(splits):
+        tr_offset = len(train_returns)
+        te_offset = len(test_returns)
+        cache: dict[str, Any] = {}
+        window_context = _build_window_context(
+            config=config,
+            prepared=prepared,
+            train_dates=tr_dates,
+            domain_map={"flat": stocks},
+            seed=seed + window_idx * 19,
+        )
+        rounds = max(1, int(config.experiments.fine_tune_rounds))
+        alloc = {s: 1.0 / len(stocks) for s in stocks}
+        prev_weights = {f"flat:{s}": alloc[s] for s in stocks}
+        print(
+            f"[window {window_idx + 1}/{len(splits)}] train_steps={len(tr_dates)} test_steps={len(te_dates)}",
+            flush=True,
+        )
+
+        ppo_policy: PPOContinuousPolicy | None = None
+        sac_policy: SACContinuousPolicy | None = None
+        if spec.baseline_kind == "flat_ppo":
+            example_state = _flat_state_vector(
+                date=tr_dates[0],
+                stocks=stocks,
+                current_alloc=alloc,
+                context=window_context,
+            )
+            ppo_policy = PPOContinuousPolicy(
+                state_dim=int(example_state.shape[0]),
+                simplex_dim=len(stocks),
+                hidden_dims=tuple(config.rl.hidden_dims),
+                learning_rate=config.rl.ppo_lr,
+                clip_ratio=config.rl.ppo_clip,
+                entropy_coef=config.rl.ppo_entropy_coef,
+                gamma=config.rl.ppo_gamma,
+                gae_lambda=config.rl.ppo_gae_lambda,
+                epochs=config.rl.ppo_epochs,
+                network_type="mlp",
+                min_hold_steps=config.rl.min_stock_hold_steps,
+                max_hold_steps=config.rl.max_stock_hold_steps,
+                hold_inertia=config.stochastic_control.hold_inertia,
+                seed=seed + window_idx * 29,
+            )
+        if spec.baseline_kind == "flat_sac":
+            example_state = _flat_state_vector(
+                date=tr_dates[0],
+                stocks=stocks,
+                current_alloc=alloc,
+                context=window_context,
+            )
+            sac_policy = SACContinuousPolicy(
+                state_dim=int(example_state.shape[0]),
+                simplex_dim=len(stocks),
+                hidden_dims=tuple(config.rl.hidden_dims),
+                learning_rate=config.rl.sac_lr,
+                gamma=config.rl.sac_gamma,
+                tau=config.rl.sac_tau,
+                alpha=config.rl.sac_alpha,
+                auto_alpha=config.rl.sac_auto_alpha,
+                target_entropy=config.rl.sac_target_entropy,
+                use_dueling_critic=config.rl.sac_use_dueling,
+                batch_size=config.rl.sac_batch_size,
+                replay_size=config.rl.sac_replay_size,
+                min_hold_steps=config.rl.min_stock_hold_steps,
+                max_hold_steps=config.rl.max_stock_hold_steps,
+                hold_inertia=config.stochastic_control.hold_inertia,
+                seed=seed + window_idx * 31,
+            )
+
+        for round_idx in range(rounds):
+            active_decision: HierarchicalDecision | None = None
+            hold_remaining = 0
+            last_action_vec: np.ndarray | None = None
+            last_logprob = 0.0
+            last_value = 0.0
+
+            for local_idx, date in enumerate(tr_dates):
+                did_rebalance = active_decision is None or hold_remaining <= 0
+                state_vec = _flat_state_vector(
+                    date=date,
+                    stocks=stocks,
+                    current_alloc=alloc,
+                    context=window_context,
+                )
+                if did_rebalance:
+                    if ppo_policy is not None:
+                        w_arr, hold_steps, action_vec, logprob, value, entropy = ppo_policy.select_action(
+                            state_vec,
+                            stochastic=config.rl.stochastic_actions,
+                        )
+                        weights = {stocks[i]: float(w_arr[i]) for i in range(len(stocks))}
+                        uncertainty = float(max(0.0, entropy))
+                        last_action_vec = action_vec
+                        last_logprob = float(logprob)
+                        last_value = float(value)
+                    elif sac_policy is not None:
+                        w_arr, hold_steps, action_vec, uncertainty = sac_policy.select_action(
+                            state_vec,
+                            stochastic=config.rl.stochastic_actions,
+                        )
+                        weights = {stocks[i]: float(w_arr[i]) for i in range(len(stocks))}
+                        uncertainty = float(max(0.0, uncertainty))
+                        last_action_vec = action_vec
+                    else:
+                        weights, hold_steps, uncertainty = _deterministic_baseline_action(
+                            kind=spec.baseline_kind,
+                            date=date,
+                            stocks=stocks,
+                            train_dates=tr_dates,
+                            context=window_context,
+                            cache=cache,
+                            max_hold_steps=config.rl.max_stock_hold_steps,
+                        )
+                    decision = _flat_decision(spec.method_id, weights, hold_steps=hold_steps, uncertainty=uncertainty)
+                    active_decision = decision
+                    hold_remaining = max(1, int(decision.top_action.hold_steps)) - 1
+                else:
+                    decision = active_decision
+                    hold_remaining = max(0, hold_remaining - 1)
+
+                assert decision is not None
+                last_decision = decision
+                train_domain_allocs.append({"flat": 1.0})
+                next_row = prepared.next_returns_df.loc[date]
+                gross = _portfolio_return(decision, next_row)
+                rank_loss = _rank_loss(decision.final_stock_weights, next_row)
+                entropy = 0.0
+                hold_over = max(0, int(decision.top_action.hold_steps) - int(config.reward.max_reasonable_hold))
+                rb = _reward(
+                    gross,
+                    prev_weights,
+                    decision.final_stock_weights,
+                    train_returns,
+                    config.reward,
+                    rank_loss=rank_loss,
+                    domain_entropy_bonus=entropy,
+                    hold_penalty=float(hold_over),
+                )
+                reward = float(rb["reward"])
+                train_returns.append(gross)
+                train_rewards.append(reward)
+                train_dates.append(str(pd.Timestamp(date).date()))
+                reward_components.append(
+                    {
+                        "phase": "train",
+                        "window": window_idx,
+                        "round": round_idx,
+                        "step": train_step,
+                        "rebalance": int(did_rebalance),
+                        **rb,
+                    }
+                )
+
+                done = local_idx == len(tr_dates) - 1
+                next_date = tr_dates[min(local_idx + 1, len(tr_dates) - 1)]
+                next_state_vec = _flat_state_vector(
+                    date=next_date,
+                    stocks=stocks,
+                    current_alloc={s: float(decision.domain_actions["flat"].stock_weights.get(s, 0.0)) for s in stocks},
+                    context=window_context,
+                )
+
+                if did_rebalance and ppo_policy is not None and last_action_vec is not None:
+                    ppo_policy.remember(
+                        state=state_vec,
+                        action_vec=last_action_vec,
+                        logprob=last_logprob,
+                        value=last_value,
+                        reward=reward,
+                        done=done,
+                    )
+                    loss = ppo_policy.learn()
+                    if loss is not None:
+                        losses.append(
+                            {
+                                "window": float(window_idx),
+                                "round": float(round_idx),
+                                "step": float(train_step),
+                                "flat_ppo": float(loss),
+                            }
+                        )
+                if did_rebalance and sac_policy is not None and last_action_vec is not None:
+                    sac_policy.store(
+                        state=state_vec,
+                        action_vec=last_action_vec,
+                        reward=reward,
+                        next_state=next_state_vec,
+                        done=done,
+                    )
+                    loss = sac_policy.train_step()
+                    if loss is not None:
+                        losses.append(
+                            {
+                                "window": float(window_idx),
+                                "round": float(round_idx),
+                                "step": float(train_step),
+                                "flat_sac": float(loss),
+                            }
+                        )
+
+                alloc = {s: float(decision.domain_actions["flat"].stock_weights.get(s, 0.0)) for s in stocks}
+                prev_weights = dict(decision.final_stock_weights)
+                train_step += 1
+
+        active_test_decision: HierarchicalDecision | None = None
+        test_hold_remaining = 0
+        for local_idx, date in enumerate(te_dates):
+            did_rebalance = active_test_decision is None or test_hold_remaining <= 0
+            if did_rebalance:
+                state_vec = _flat_state_vector(
+                    date=date,
+                    stocks=stocks,
+                    current_alloc=alloc,
+                    context=window_context,
+                )
+                if ppo_policy is not None:
+                    w_arr, hold_steps, _, _, _, entropy = ppo_policy.select_action(state_vec, stochastic=False)
+                    weights = {stocks[i]: float(w_arr[i]) for i in range(len(stocks))}
+                    uncertainty = float(max(0.0, entropy))
+                elif sac_policy is not None:
+                    w_arr, hold_steps, _, uncertainty = sac_policy.select_action(state_vec, stochastic=False)
+                    weights = {stocks[i]: float(w_arr[i]) for i in range(len(stocks))}
+                    uncertainty = float(max(0.0, uncertainty))
+                else:
+                    weights, hold_steps, uncertainty = _deterministic_baseline_action(
+                        kind=spec.baseline_kind,
+                        date=date,
+                        stocks=stocks,
+                        train_dates=tr_dates,
+                        context=window_context,
+                        cache=cache,
+                        max_hold_steps=config.rl.max_stock_hold_steps,
+                    )
+                decision = _flat_decision(spec.method_id, weights, hold_steps=hold_steps, uncertainty=uncertainty)
+                active_test_decision = decision
+                test_hold_remaining = max(1, int(decision.top_action.hold_steps)) - 1
+            else:
+                decision = active_test_decision
+                test_hold_remaining = max(0, test_hold_remaining - 1)
+
+            assert decision is not None
+            last_decision = decision
+            test_domain_allocs.append({"flat": 1.0})
+            next_row = prepared.next_returns_df.loc[date]
+            gross = _portfolio_return(decision, next_row)
+            rank_loss = _rank_loss(decision.final_stock_weights, next_row)
+            hold_over = max(0, int(decision.top_action.hold_steps) - int(config.reward.max_reasonable_hold))
+            rb = _reward(
+                gross,
+                prev_weights,
+                decision.final_stock_weights,
+                test_returns,
+                config.reward,
+                rank_loss=rank_loss,
+                domain_entropy_bonus=0.0,
+                hold_penalty=float(hold_over),
+            )
+            test_returns.append(gross)
+            test_dates.append(str(pd.Timestamp(date).date()))
+            reward_components.append(
+                {
+                    "phase": "test",
+                    "window": window_idx,
+                    "round": -1,
+                    "step": test_step,
+                    "rebalance": int(did_rebalance),
+                    **rb,
+                }
+            )
+            regime = str(window_context.regimes.loc[date])
+            regime_returns.setdefault(regime, []).append(gross)
+            alloc = {s: float(decision.domain_actions["flat"].stock_weights.get(s, 0.0)) for s in stocks}
+            prev_weights = dict(decision.final_stock_weights)
+            test_step += 1
+            if (local_idx + 1) % max(1, len(te_dates) // 5) == 0 or local_idx + 1 == len(te_dates):
+                print(
+                    f"    test_step={local_idx + 1}/{len(te_dates)} gross={gross:.5f} rebalance={int(did_rebalance)} hold_left={test_hold_remaining}",
+                    flush=True,
+                )
+
+        walk.append(
+            {
+                "window": window_idx,
+                "train_start": str(pd.Timestamp(tr_dates[0]).date()) if tr_dates else "",
+                "train_end": str(pd.Timestamp(tr_dates[-1]).date()) if tr_dates else "",
+                "test_start": str(pd.Timestamp(te_dates[0]).date()) if te_dates else "",
+                "test_end": str(pd.Timestamp(te_dates[-1]).date()) if te_dates else "",
+                "train_metrics": _metrics_dict(_metrics(train_returns[tr_offset:], config.reward.cvar_alpha)),
+                "test_metrics": _metrics_dict(_metrics(test_returns[te_offset:], config.reward.cvar_alpha)),
+            }
+        )
+
+    if last_decision is None:
+        raise ValueError("No decision generated in baseline run")
+    regime_metrics = {
+        name: _metrics_dict(_metrics(vals, config.reward.cvar_alpha))
+        for name, vals in regime_returns.items()
+        if vals
+    }
+    eval_extras = _evaluation_extras(
+        method_count=max(1, len(config.experiments.methods or config.experiments.modes or [config.top_mode])),
+        test_dates=test_dates,
+        test_returns=test_returns,
+        reward_components=reward_components,
+        liquidity_df=prepared.liquidity_df,
+        cvar_alpha=config.reward.cvar_alpha,
+    )
+    return TrainingResult(
+        provider=prepared.provider_label,
+        mode=spec.method_id,
+        seed=seed,
+        train_rewards=train_rewards,
+        train_period_returns=train_returns,
+        test_period_returns=test_returns,
+        losses=losses,
+        train_metrics=_metrics(train_returns, config.reward.cvar_alpha),
+        test_metrics=_metrics(test_returns, config.reward.cvar_alpha),
+        train_dates=train_dates,
+        test_dates=test_dates,
+        train_domain_allocations=train_domain_allocs,
+        test_domain_allocations=test_domain_allocs,
+        last_decision=last_decision,
+        reward_components=reward_components,
+        walk_forward_windows=walk,
+        regime_metrics=regime_metrics,
+        evaluation_extras=eval_extras,
+    )
+
+
 def _run_single(config: ProjectConfig, mode: str, seed: int, prepared: PreparedData) -> TrainingResult:
+    spec = _method_from_name(mode, config)
+    if spec.family == "baseline":
+        return _run_baseline_single(config=config, spec=spec, seed=seed, prepared=prepared)
+
     splits = _walk_splits(config, prepared.valid_dates)
     train_rewards: list[float] = []
     train_returns: list[float] = []
@@ -1016,13 +1833,18 @@ def _run_single(config: ProjectConfig, mode: str, seed: int, prepared: PreparedD
     max_training_steps = int(config.rl.training_steps) if int(config.rl.training_steps) > 0 else None
     total_windows = len(splits)
     print(
-        f"[run] mode={mode} seed={seed} windows={total_windows} fine_tune_rounds={max(1, int(config.experiments.fine_tune_rounds))}",
+        f"[run] mode={spec.method_id} seed={seed} windows={total_windows} fine_tune_rounds={max(1, int(config.experiments.fine_tune_rounds))}",
         flush=True,
     )
 
     stop_training = False
     for window_idx, (tr_dates, te_dates, _start) in enumerate(splits):
-        window_domain_map = _resolve_window_domain_map(config, prepared, tr_dates)
+        window_domain_map = _resolve_window_domain_map(
+            config,
+            prepared,
+            tr_dates,
+            use_learned_clusters=spec.use_learned_clusters,
+        )
         window_context = _build_window_context(
             config=config,
             prepared=prepared,
@@ -1043,7 +1865,7 @@ def _run_single(config: ProjectConfig, mode: str, seed: int, prepared: PreparedD
         )
         s_count = len(window_context.stock_feature_names)
         agent = build_hierarchical_agent(
-            mode=mode,
+            mode=spec.top_mode,
             domain_to_stocks=window_context.domain_to_stocks,
             max_domain_hold_steps=config.rl.max_domain_hold_steps,
             max_stock_hold_steps=config.rl.max_stock_hold_steps,
@@ -1052,7 +1874,7 @@ def _run_single(config: ProjectConfig, mode: str, seed: int, prepared: PreparedD
             num_stock_features=s_count,
             stock_feature_names=window_context.stock_feature_names,
             rl_config=config.rl,
-            stochastic_control=config.stochastic_control,
+            stochastic_control=config.stochastic_control if spec.use_stochastic_control else None,
             seed=seed + window_idx * 13,
         )
         domain_alloc, stock_allocs, prev_weights = _init_allocations(window_context.domain_to_stocks)
@@ -1089,8 +1911,10 @@ def _run_single(config: ProjectConfig, mode: str, seed: int, prepared: PreparedD
                     momentum_df=window_context.momentum_df,
                     volatility_df=window_context.volatility_df,
                     liquidity_df=window_context.liquidity_df,
+                    include_global_features=spec.use_global_macro_features,
+                    include_liquidity_features=spec.use_liquidity_features,
                 )
-                did_rebalance = active_train_decision is None or train_hold_remaining <= 0
+                did_rebalance = (active_train_decision is None or train_hold_remaining <= 0) if spec.enforce_hold else True
                 if did_rebalance:
                     decision = agent.decide(
                         top_state=top_state,
@@ -1098,7 +1922,7 @@ def _run_single(config: ProjectConfig, mode: str, seed: int, prepared: PreparedD
                         stochastic=config.rl.stochastic_actions,
                     )
                     active_train_decision = decision
-                    train_hold_remaining = max(1, int(decision.top_action.hold_steps)) - 1
+                    train_hold_remaining = max(1, int(decision.top_action.hold_steps)) - 1 if spec.enforce_hold else 0
                 else:
                     decision = active_train_decision
                     train_hold_remaining = max(0, train_hold_remaining - 1)
@@ -1106,15 +1930,39 @@ def _run_single(config: ProjectConfig, mode: str, seed: int, prepared: PreparedD
                 assert decision is not None
                 last_decision = decision
                 train_domain_allocs.append(dict(decision.final_domain_weights))
-                gross = _portfolio_return(decision, prepared.next_returns_df.loc[date])
-                rb = _reward(gross, prev_weights, decision.final_stock_weights, train_returns, config.reward)
+                next_row = prepared.next_returns_df.loc[date]
+                gross = _portfolio_return(decision, next_row)
+                rank_loss = _rank_loss(decision.final_stock_weights, next_row)
+                entropy = -sum(
+                    float(w) * math.log(max(1e-12, float(w)))
+                    for w in decision.final_domain_weights.values()
+                )
+                hold_over = max(0, int(decision.top_action.hold_steps) - int(config.reward.max_reasonable_hold))
+                rb = _reward(
+                    gross,
+                    prev_weights,
+                    decision.final_stock_weights,
+                    train_returns,
+                    config.reward,
+                    rank_loss=rank_loss,
+                    domain_entropy_bonus=entropy,
+                    hold_penalty=float(hold_over),
+                )
                 reward = float(rb["reward"])
                 train_returns.append(gross)
                 train_rewards.append(reward)
                 train_dates.append(str(pd.Timestamp(date).date()))
                 reward_components.append(
-                    {"phase": "train", "window": window_idx, "round": round_idx, "step": train_step, **rb}
+                    {
+                        "phase": "train",
+                        "window": window_idx,
+                        "round": round_idx,
+                        "step": train_step,
+                        "rebalance": int(did_rebalance),
+                        **rb,
+                    }
                 )
+                d_rewards = _domain_step_rewards(decision, next_row)
 
                 next_domain_alloc = dict(decision.final_domain_weights)
                 next_stock_allocs = dict(stock_allocs)
@@ -1136,6 +1984,8 @@ def _run_single(config: ProjectConfig, mode: str, seed: int, prepared: PreparedD
                     momentum_df=window_context.momentum_df,
                     volatility_df=window_context.volatility_df,
                     liquidity_df=window_context.liquidity_df,
+                    include_global_features=spec.use_global_macro_features,
+                    include_liquidity_features=spec.use_liquidity_features,
                 )
                 done = local_idx == len(tr_dates) - 1
                 if did_rebalance:
@@ -1148,6 +1998,7 @@ def _run_single(config: ProjectConfig, mode: str, seed: int, prepared: PreparedD
                         decision=decision,
                         reward=reward,
                         done=done,
+                        domain_rewards=d_rewards,
                     )
                     if step_losses:
                         row = {"window": float(window_idx), "round": float(round_idx), "step": float(train_step)}
@@ -1187,12 +2038,14 @@ def _run_single(config: ProjectConfig, mode: str, seed: int, prepared: PreparedD
                 momentum_df=window_context.momentum_df,
                 volatility_df=window_context.volatility_df,
                 liquidity_df=window_context.liquidity_df,
+                include_global_features=spec.use_global_macro_features,
+                include_liquidity_features=spec.use_liquidity_features,
             )
-            did_rebalance = active_test_decision is None or test_hold_remaining <= 0
+            did_rebalance = (active_test_decision is None or test_hold_remaining <= 0) if spec.enforce_hold else True
             if did_rebalance:
                 decision = agent.decide(top_state=top_state, domain_states=domain_states, stochastic=False)
                 active_test_decision = decision
-                test_hold_remaining = max(1, int(decision.top_action.hold_steps)) - 1
+                test_hold_remaining = max(1, int(decision.top_action.hold_steps)) - 1 if spec.enforce_hold else 0
             else:
                 decision = active_test_decision
                 test_hold_remaining = max(0, test_hold_remaining - 1)
@@ -1200,12 +2053,35 @@ def _run_single(config: ProjectConfig, mode: str, seed: int, prepared: PreparedD
             assert decision is not None
             last_decision = decision
             test_domain_allocs.append(dict(decision.final_domain_weights))
-            gross = _portfolio_return(decision, prepared.next_returns_df.loc[date])
-            rb = _reward(gross, prev_weights, decision.final_stock_weights, test_returns, config.reward)
+            next_row = prepared.next_returns_df.loc[date]
+            gross = _portfolio_return(decision, next_row)
+            rank_loss = _rank_loss(decision.final_stock_weights, next_row)
+            entropy = -sum(
+                float(w) * math.log(max(1e-12, float(w)))
+                for w in decision.final_domain_weights.values()
+            )
+            hold_over = max(0, int(decision.top_action.hold_steps) - int(config.reward.max_reasonable_hold))
+            rb = _reward(
+                gross,
+                prev_weights,
+                decision.final_stock_weights,
+                test_returns,
+                config.reward,
+                rank_loss=rank_loss,
+                domain_entropy_bonus=entropy,
+                hold_penalty=float(hold_over),
+            )
             test_returns.append(gross)
             test_dates.append(str(pd.Timestamp(date).date()))
             reward_components.append(
-                {"phase": "test", "window": window_idx, "round": -1, "step": test_step, **rb}
+                {
+                    "phase": "test",
+                    "window": window_idx,
+                    "round": -1,
+                    "step": test_step,
+                    "rebalance": int(did_rebalance),
+                    **rb,
+                }
             )
             regime = str(window_context.regimes.loc[date])
             regime_returns.setdefault(regime, []).append(gross)
@@ -1248,9 +2124,17 @@ def _run_single(config: ProjectConfig, mode: str, seed: int, prepared: PreparedD
         for name, vals in regime_returns.items()
         if vals
     }
+    eval_extras = _evaluation_extras(
+        method_count=max(1, len(config.experiments.methods or config.experiments.modes or [config.top_mode])),
+        test_dates=test_dates,
+        test_returns=test_returns,
+        reward_components=reward_components,
+        liquidity_df=prepared.liquidity_df,
+        cvar_alpha=config.reward.cvar_alpha,
+    )
     return TrainingResult(
         provider=prepared.provider_label,
-        mode=mode,
+        mode=spec.method_id,
         seed=seed,
         train_rewards=train_rewards,
         train_period_returns=train_returns,
@@ -1266,6 +2150,7 @@ def _run_single(config: ProjectConfig, mode: str, seed: int, prepared: PreparedD
         reward_components=reward_components,
         walk_forward_windows=walk,
         regime_metrics=regime_metrics,
+        evaluation_extras=eval_extras,
     )
 
 
@@ -1385,6 +2270,7 @@ def save_training_result(result: TrainingResult, output_dir: str | Path) -> Trai
         "train_metrics": _metrics_dict(result.train_metrics),
         "test_metrics": _metrics_dict(result.test_metrics),
         "regime_metrics": result.regime_metrics,
+        "evaluation_extras": result.evaluation_extras,
         "walk_forward_windows": result.walk_forward_windows,
         "last_top_hold_steps": result.last_decision.top_action.hold_steps,
         "last_top_weights": dict(result.last_decision.top_action.domain_weights),
@@ -1417,6 +2303,7 @@ def save_training_result(result: TrainingResult, output_dir: str | Path) -> Trai
         reward_components=result.reward_components,
         walk_forward_windows=result.walk_forward_windows,
         regime_metrics=result.regime_metrics,
+        evaluation_extras=result.evaluation_extras,
         output_dir=str(path),
     )
 
@@ -1450,9 +2337,9 @@ def run_training(config_path: str | Path) -> TrainingResult:
 def run_multiple_experiments(config_path: str | Path) -> BatchResult:
     config = load_config(config_path)
     prepared = _prepare_data(config)
-    modes = config.experiments.modes or [config.top_mode]
+    methods = config.experiments.methods or config.experiments.modes or [config.top_mode]
     seeds = config.experiments.seeds or [config.rl.random_seed]
-    grid = [(m, s) for m in modes for s in seeds] or [(config.top_mode, config.rl.random_seed)]
+    grid = [(m, s) for m in methods for s in seeds] or [(config.top_mode, config.rl.random_seed)]
 
     stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     batch_dir = Path(config.experiments.results_dir) / f"{config.experiments.run_name}_{stamp}"
@@ -1460,17 +2347,17 @@ def run_multiple_experiments(config_path: str | Path) -> BatchResult:
 
     runs: list[TrainingResult] = []
     summary_rows: list[dict[str, Any]] = []
-    for idx, (mode, seed) in enumerate(grid):
-        print(f"[{idx + 1}/{len(grid)}] running mode={mode}, seed={seed}")
-        run_result = _run_single(config=config, mode=mode, seed=seed, prepared=prepared)
-        run_dir = batch_dir / f"run_{idx:02d}_{mode}_seed{seed}"
+    for idx, (method_id, seed) in enumerate(grid):
+        print(f"[{idx + 1}/{len(grid)}] running method={method_id}, seed={seed}")
+        run_result = _run_single(config=config, mode=method_id, seed=seed, prepared=prepared)
+        run_dir = batch_dir / str(method_id) / f"seed_{seed}"
         run_result = save_training_result(run_result, run_dir)
         print(f"[{idx + 1}/{len(grid)}] saved artifacts: {run_dir}")
         runs.append(run_result)
         summary_rows.append(
             {
                 "run": run_dir.name,
-                "mode": run_result.mode,
+                "method": run_result.mode,
                 "seed": run_result.seed,
                 "train_cumulative_return": run_result.train_metrics.cumulative_return,
                 "test_cumulative_return": run_result.test_metrics.cumulative_return,

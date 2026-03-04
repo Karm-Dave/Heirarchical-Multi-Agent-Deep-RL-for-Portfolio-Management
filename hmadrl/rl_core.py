@@ -530,6 +530,7 @@ class ContinuousTransition:
     reward: float
     next_state: np.ndarray
     done: bool
+    n_steps: int = 1
 
 
 class ContinuousReplayBuffer:
@@ -592,6 +593,7 @@ class SACContinuousPolicy:
         min_hold_steps: int = 2,
         max_hold_steps: int = 8,
         hold_inertia: float = 0.75,
+        n_step: int = 3,
         seed: int = 0,
         device: str | None = None,
     ) -> None:
@@ -607,6 +609,7 @@ class SACContinuousPolicy:
         self.alpha = alpha
         self.auto_alpha = bool(auto_alpha)
         self.batch_size = batch_size
+        self.n_step = max(1, int(n_step))
         self.min_hold_steps = min_hold_steps
         self.max_hold_steps = max_hold_steps
         self.hold_inertia = hold_inertia
@@ -637,6 +640,9 @@ class SACContinuousPolicy:
             self.alpha_opt = None
             self.target_entropy = float(target_entropy if target_entropy is not None else -float(self.action_dim))
         self.replay = ContinuousReplayBuffer(replay_size, seed=seed)
+        self._nstep_buffer: deque[tuple[np.ndarray, np.ndarray, float, np.ndarray, bool]] = deque(
+            maxlen=max(2, self.n_step + 1)
+        )
 
     def _distribution(self, states: torch.Tensor):
         alpha, beta_a, beta_b = self.actor(states)
@@ -689,15 +695,44 @@ class SACContinuousPolicy:
         next_state: Iterable[float],
         done: bool,
     ) -> None:
-        self.replay.push(
-            ContinuousTransition(
-                state=np.asarray(list(state), dtype=np.float32),
-                action=np.asarray(list(action_vec), dtype=np.float32),
-                reward=float(reward),
-                next_state=np.asarray(list(next_state), dtype=np.float32),
-                done=bool(done),
+        state_arr = np.asarray(list(state), dtype=np.float32)
+        action_arr = np.asarray(list(action_vec), dtype=np.float32)
+        next_state_arr = np.asarray(list(next_state), dtype=np.float32)
+        self._nstep_buffer.append((state_arr, action_arr, float(reward), next_state_arr, bool(done)))
+
+        def _push_from_buffer() -> None:
+            if not self._nstep_buffer:
+                return
+            total_reward = 0.0
+            next_s = self._nstep_buffer[0][3]
+            done_flag = False
+            used = 0
+            for used, (_, _, r, n_s, d) in enumerate(list(self._nstep_buffer)[: self.n_step], start=1):
+                total_reward += (self.gamma ** (used - 1)) * float(r)
+                next_s = n_s
+                done_flag = bool(d)
+                if d:
+                    break
+            s0, a0, _, _, _ = self._nstep_buffer[0]
+            self.replay.push(
+                ContinuousTransition(
+                    state=s0,
+                    action=a0,
+                    reward=float(total_reward),
+                    next_state=next_s,
+                    done=done_flag,
+                    n_steps=int(used),
+                )
             )
-        )
+
+        if len(self._nstep_buffer) >= self.n_step:
+            _push_from_buffer()
+            self._nstep_buffer.popleft()
+
+        if done:
+            while self._nstep_buffer:
+                _push_from_buffer()
+                self._nstep_buffer.popleft()
 
     def train_step(self) -> float | None:
         if len(self.replay) < self.batch_size:
@@ -709,11 +744,13 @@ class SACContinuousPolicy:
         rewards = torch.as_tensor([b.reward for b in batch], dtype=torch.float32, device=self.device)
         next_states = torch.as_tensor(np.stack([b.next_state for b in batch]), dtype=torch.float32, device=self.device)
         dones = torch.as_tensor([float(b.done) for b in batch], dtype=torch.float32, device=self.device)
+        n_steps = torch.as_tensor([float(b.n_steps) for b in batch], dtype=torch.float32, device=self.device)
 
         with torch.no_grad():
             next_actions, next_logprob, _ = self._sample_action_batch(next_states, stochastic=True)
             q_next = torch.min(self.q1_target(next_states, next_actions), self.q2_target(next_states, next_actions))
-            target_q = rewards + (1.0 - dones) * self.gamma * (q_next - self.alpha * next_logprob)
+            discount = torch.pow(torch.full_like(n_steps, self.gamma), n_steps)
+            target_q = rewards + (1.0 - dones) * discount * (q_next - self.alpha * next_logprob)
 
         q1_pred = self.q1(states, actions)
         q2_pred = self.q2(states, actions)

@@ -41,6 +41,10 @@ class RLConfig:
     sac_use_dueling: bool
     sac_batch_size: int
     sac_replay_size: int
+    sac_n_step: int
+    uncertainty_alpha: float
+    router_entropy_coef: float
+    router_load_balance_coef: float
 
 
 @dataclass(frozen=True)
@@ -73,6 +77,10 @@ class RewardConfig:
     cvar_alpha: float
     cvar_penalty: float
     reward_window: int
+    rank_loss_coef: float = 0.0
+    domain_entropy_coef: float = 0.0
+    hold_penalty_coef: float = 0.0
+    max_reasonable_hold: int = 8
 
 
 @dataclass(frozen=True)
@@ -91,6 +99,7 @@ class StochasticControlConfig:
 class ExperimentConfig:
     results_dir: str
     run_name: str
+    methods: list[str]
     modes: list[str]
     seeds: list[int]
     fine_tune_rounds: int
@@ -141,6 +150,24 @@ def load_config(path: str | Path) -> ProjectConfig:
     stochastic_raw = dict(raw.get("stochastic_control", {}))
     experiments_raw = dict(raw.get("experiments", {}))
 
+    default_methods = [
+        "rl",
+        "moe_router",
+        "equal_weight",
+        "risk_parity",
+        "hrp",
+        "flat_ppo",
+        "flat_sac",
+        "lstm_portfolio",
+        "transformer_portfolio",
+        "ablation_no_learned_clusters",
+        "ablation_no_stochastic_control",
+        "ablation_no_hold_enforcement",
+        "ablation_no_global_macro",
+        "ablation_no_liquidity",
+        "ablation_static_sectors",
+    ]
+    methods = [str(m) for m in experiments_raw.get("methods", experiments_raw.get("modes", default_methods))]
     modes = [str(m) for m in experiments_raw.get("modes", [str(raw["top_mode"])])]
     seeds = _as_int_list(experiments_raw.get("seeds", [int(rl_raw["random_seed"])]))
 
@@ -182,6 +209,10 @@ def load_config(path: str | Path) -> ProjectConfig:
             sac_use_dueling=bool(rl_raw.get("sac_use_dueling", True)),
             sac_batch_size=max(8, int(rl_raw.get("sac_batch_size", 64))),
             sac_replay_size=max(256, int(rl_raw.get("sac_replay_size", 20000))),
+            sac_n_step=max(1, int(rl_raw.get("sac_n_step", 3))),
+            uncertainty_alpha=float(rl_raw.get("uncertainty_alpha", 0.75)),
+            router_entropy_coef=float(rl_raw.get("router_entropy_coef", 0.01)),
+            router_load_balance_coef=float(rl_raw.get("router_load_balance_coef", 0.03)),
         ),
         data=DataConfig(
             start_date=str(data_raw["start_date"]),
@@ -225,6 +256,10 @@ def load_config(path: str | Path) -> ProjectConfig:
             cvar_alpha=float(reward_raw.get("cvar_alpha", 0.1)),
             cvar_penalty=float(reward_raw.get("cvar_penalty", 1.5)),
             reward_window=max(10, int(reward_raw.get("reward_window", 60))),
+            rank_loss_coef=float(reward_raw.get("rank_loss_coef", 0.05)),
+            domain_entropy_coef=float(reward_raw.get("domain_entropy_coef", 0.02)),
+            hold_penalty_coef=float(reward_raw.get("hold_penalty_coef", 0.01)),
+            max_reasonable_hold=max(1, int(reward_raw.get("max_reasonable_hold", 8))),
         ),
         stochastic_control=StochasticControlConfig(
             risk_aversion=float(stochastic_raw.get("risk_aversion", 3.0)),
@@ -239,6 +274,7 @@ def load_config(path: str | Path) -> ProjectConfig:
         experiments=ExperimentConfig(
             results_dir=str(experiments_raw.get("results_dir", "results")),
             run_name=str(experiments_raw.get("run_name", "hmadrl_continuous_batch")),
+            methods=methods,
             modes=modes,
             seeds=seeds,
             fine_tune_rounds=max(1, int(experiments_raw.get("fine_tune_rounds", 2))),

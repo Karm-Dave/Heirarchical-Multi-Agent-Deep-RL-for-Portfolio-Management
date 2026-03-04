@@ -10,6 +10,7 @@ from hmadrl.config import load_config
 from hmadrl.pipeline import (
     PreparedData,
     _classify_regime,
+    _method_from_name,
     _normalize_frame_by_window,
     _resolve_window_domain_map,
 )
@@ -94,8 +95,8 @@ class TestTemporalClean(unittest.TestCase):
             provider_label="test",
         )
 
-        first_map = _resolve_window_domain_map(cfg, prepared, list(dates[:60]))
-        second_map = _resolve_window_domain_map(cfg, prepared, list(dates[60:]))
+        first_map = _resolve_window_domain_map(cfg, prepared, list(dates[:60]), use_learned_clusters=True)
+        second_map = _resolve_window_domain_map(cfg, prepared, list(dates[60:]), use_learned_clusters=True)
 
         def same_cluster(mapping: dict[str, list[str]], left: str, right: str) -> bool:
             for symbols in mapping.values():
@@ -119,6 +120,14 @@ class TestTemporalClean(unittest.TestCase):
         test_mean = float(norm.loc[test_dates, "x"].mean())
         self.assertAlmostEqual(train_mean, 0.0, places=6)
         self.assertGreater(test_mean, 10.0)
+
+    def test_method_registry_contains_baselines_and_ablation(self) -> None:
+        cfg = _build_config()
+        self.assertEqual(_method_from_name("equal_weight", cfg).family, "baseline")
+        self.assertEqual(_method_from_name("flat_sac", cfg).family, "baseline")
+        ab = _method_from_name("ablation_no_global_macro", cfg)
+        self.assertEqual(ab.family, "hierarchical")
+        self.assertFalse(ab.use_global_macro_features)
 
 
 if __name__ == "__main__":
