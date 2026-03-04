@@ -28,3 +28,10 @@ git switch experimental_except_yep
 git reset --hard 47d2a22
 # Non-destructive inspection:
 git switch --detach 47d2a22
+
+# Checkpoint: research-grade methods + evaluation upgrades (2026-03-04)
+# Restore branch exactly to this checkpoint:
+git switch experimental_except_yep
+git reset --hard 9b59960
+# Non-destructive inspection:
+git switch --detach 9b59960
