@@ -1,280 +1,115 @@
-# HMADRL
-### Hierarchical Multi-Agent Deep Reinforcement Learning for Portfolio Allocation
+# Hierarchical Multi-Agent Deep RL for Portfolio Management
 
-> A research-grade hierarchical reinforcement learning framework combining **hierarchical decision-making**, **stochastic control**, **domain specialization**, and **walk-forward evaluation** for robust portfolio strategies on real market data.
+End-to-end hierarchical portfolio system with:
 
----
+- A top allocator (switchable RL or MoE router)
+- Multiple lower allocation agents (domain/cluster level)
+- Stochastic control constraints
+- Walk-forward training/evaluation on real market data
 
-## Table of Contents
+The project is designed for experimentation and reproducible research with modular components in `hmadrl/`.
 
-- [Architecture Overview](#architecture-overview)
-- [Key Features](#key-features)
-- [System Execution Flow](#system-execution-flow)
-- [Hierarchical Decision System](#hierarchical-decision-system)
-- [Training & Reward System](#training--reward-system)
-- [Evaluation](#evaluation)
-- [Output Structure](#output-structure)
-- [Running Experiments](#running-experiments)
+## What This Repo Does
 
----
+1. Fetches real data (`stooq` and/or `yfinance`) for stocks + macro/factor symbols.
+2. Builds rich multi-scale features (stock, domain, global).
+3. Builds hierarchical states:
+   - `TopLevelState` for the top manager
+   - `DomainState` for each lower manager
+4. Produces hierarchical actions:
+   - top domain weights + hold horizon
+   - per-domain stock weights + hold horizon
+5. Applies stochastic control mediation (`capital_budget`, `risk_budget`, caps, hold constraints).
+6. Runs walk-forward train/test windows with cost-aware rewards.
+7. Saves metrics, CSVs, plots, and summaries to `results/`.
 
-## Architecture Overview
+## Architecture
 
-HMADRL models portfolio construction as a **multi-level decision hierarchy** that mirrors real institutional portfolio management — separating asset allocation from security selection.
+### Top Layer (Strategy Allocation)
 
-![HMADRL Architecture](image.png)
+- `mode=rl`: `RLTopManager` (continuous PPO ensemble; optional transformer top network).
+- `mode=moe_router`: `MoERouterTopManager` (router selecting experts: momentum/low-vol/liquidity).
 
----
+Output:
+- domain/cluster allocation weights
+- top hold duration
 
-## Key Features
+### Lower Layer (Stock Allocation)
 
-### 🧠 Advanced Reinforcement Learning
+- `DomainRLManager` uses continuous SAC ensemble.
+- Produces stock-level weights + stock hold duration.
+- Post-processed with stochastic control constraints.
 
-| Component | Algorithm | Role |
-|-----------|-----------|------|
-| Top Manager | PPO Ensemble | Domain-level capital allocation |
-| Domain Managers | SAC Ensemble | Stock-level security selection |
-| Router | MoE Neural Router | Expert selection |
+### Control Layer
 
-Additional techniques:
-- Uncertainty-aware policy aggregation
-- Entropy regularization
-- Hold-period learning
-- Risk-aware reward shaping
+`StochasticController` computes dynamic per-domain controls from momentum/vol/liquidity + global stress:
 
----
+- `capital_budget`
+- `risk_budget`
+- `max_stock_weight`
+- `hold_steps`
 
-### 🔀 Mixture-of-Experts Router
+## Data And Features
 
-An alternative top manager uses **MoE routing** to dynamically select among specialized experts:
+The pipeline supports:
 
-```
-Momentum Expert  ──┐
-Low-Vol Expert   ──┼──▶  Neural Router Policy  ──▶  Allocation
-Liquidity Expert ──┘
-```
+- Multi-horizon momentum and volatility
+- Liquidity and microstructure proxies
+- Cross-sectional stock signals
+- Domain/cluster factors
+- Global regime and macro signals
 
-The router is trained with **entropy regularization** and **load balancing penalties** to prevent expert collapse.
+Data providers:
 
----
+- `stooq` (free)
+- `yfinance` (free)
+- `auto` fallback chain (`stooq -> yfinance`)
 
-### 📐 Stochastic Financial Control
+## Main Files
 
-The stochastic controller layer integrates classical financial theory with learned dynamics:
+- `hmadrl/pipeline.py`: data prep, feature engineering, walk-forward train/test, artifacts
+- `hmadrl/top_manager.py`: top-layer RL and MoE router logic
+- `hmadrl/domain_manager.py`: lower-layer SAC manager
+- `hmadrl/stochastic_control.py`: risk mediation/control equations
+- `hmadrl/rl_core.py`: PPO/SAC implementations
+- `hmadrl/factory.py`: manager/agent assembly by mode
+- `run_experiment.py`: CLI entry point
 
-| Model | Purpose |
-|-------|---------|
-| Merton Portfolio Approximation | Optimal allocation proxy |
-| Ornstein-Uhlenbeck Latent Dynamics | Mean-reverting state estimation |
-| Stress Modeling | Tail-risk scenario conditioning |
+## Setup
 
-**Output control signals:**
+Windows (PowerShell):
 
-```yaml
-capital_budget:    # Total capital to deploy
-risk_budget:       # Allowable portfolio risk
-max_stock_weight:  # Per-asset concentration limit
-hold_steps:        # Rebalance frequency control
-merton_fraction:   # Risky asset fraction proxy
-uncertainty:       # Epistemic uncertainty estimate
-```
-
----
-
-### 🗂️ Domain Specialization
-
-Stocks are grouped into **domains** using one of three methods:
-
-- `static`    → Predefined sector classifications
-- `rolling`   → Correlation-based clustering (walk-forward)
-- `learned`   → Unsupervised clustering (train-only fit)
-
-Each domain has its own **independent SAC ensemble policy** for stock selection.
-
----
-
-### 📊 Real Market Data Pipeline
-
-**Data sources:**
-
-```
-stooq  ──┐
-         ├──▶  auto (stooq → yfinance fallback)  ──▶  data_cache/
-yfinance─┘
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-**Feature set:**
+## Run
 
-| Level | Features |
-|-------|----------|
-| **Stock** | Momentum, volatility, EMA trends, liquidity, microstructure |
-| **Domain** | Relative strength, beta proxy, correlation dispersion, cluster Sharpe, drawdown |
-| **Global** | Market volatility, breadth indicators, tail risk, cross-asset signals, rate dynamics, regime indicators |
+Run tests:
 
----
-
-### 🔒 Leakage-Safe Pipeline
-
-Research-grade backtesting integrity is enforced via strict temporal controls:
-
-| Protection | Implementation |
-|------------|---------------|
-| Regime labels | Expanding quantile (no future data) |
-| Macro features | Shifted by one period |
-| Domain factors | Shifted by one period |
-| Normalization | Fit on train window only |
-| Clustering | Fit on train window only |
-| Evaluation | Walk-forward out-of-sample |
-
----
-
-## System Execution Flow
-
-### Entry Point
-
-```python
-# Single experiment
-run_training(...)
-
-# Batch (multiple seeds + method comparisons)
-run_multiple_experiments(...)
+```powershell
+python -m unittest discover -s tests -v
 ```
 
-### Configuration
+Run a quick smoke batch:
 
-```
-ProjectConfig
-├── RLConfig            # Hyperparameters, algorithms
-├── DataConfig          # Datasets, date ranges
-├── RewardConfig        # Penalties and bonuses
-├── StochasticControlConfig
-└── ExperimentConfig    # Output paths, seeds
+```powershell
+python run_experiment.py --config config/smoke_config.json
 ```
 
-### Walk-Forward Windows
+Run full batch:
 
-```
-│◄── Train Window ──►│◄─ Test ─►│
-                      │◄── Train Window ──►│◄─ Test ─►│
-                                            │◄── Train Window ──►│◄─ Test ─►│
+```powershell
+python run_experiment.py --config config/default_config.json
 ```
 
-Parameters: `walk_forward_train` · `walk_forward_test` · `walk_forward_step`
+Run a single experiment only:
 
----
-
-## Hierarchical Decision System
-
-### Top Manager — `RLTopManager`
-
-Uses a **PPO ensemble** to output domain weights and hold periods.
-
-**Uncertainty attenuation:**
-
-$$w \leftarrow w \cdot e^{-\alpha \sigma}$$
-
-Weights are renormalized after adjustment.
-
----
-
-### Top Manager — `MoERouterTopManager`
-
-Uses expert routing with:
-- Entropy regularization
-- Load balancing penalties
-- Reward-driven router training
-
----
-
-### Stochastic Controller
-
-Transforms top-level allocations into financial control signals using **OU latent dynamics** and **Merton portfolio theory**.
-
----
-
-### Domain Managers
-
-Each domain runs an independent **SAC ensemble**. Features include:
-
-- Uncertainty-weighted action aggregation
-- Lagrangian risk penalty enforcement
-- Per-asset weight caps
-- Hold period decisions
-
----
-
-### Final Portfolio Construction
-
-```
-Domain Outputs
-     │
-     ▼
-Weight Normalization
-     │
-     ▼
-Volatility Targeting
-     │
-     ▼
-Risk Scaling
-     │
-     ▼
-Final Stock Weights
-```
-
----
-
-## Training & Reward System
-
-The reward signal is a **composite of multiple financial objectives**:
-
-```
-R = portfolio_return
-  − rank_consistency_loss
-  − turnover_penalty
-  − transaction_cost_penalty
-  − slippage_penalty
-  − downside_risk_penalty
-  − CVaR_normalization_term
-  − hold_penalty
-  + domain_entropy_bonus
-```
-
-**Train vs. Test behavior:**
-
-| Mode | Actions | Learning |
-|------|---------|----------|
-| Train | Stochastic | Enabled, multi-epoch fine-tuning |
-| Test | Deterministic | Disabled, pure evaluation |
-
----
-
-## Evaluation
-
-### Core Metrics
-
-| Metric | Description |
-|--------|-------------|
-| Cumulative Return | Total compounded return |
-| Annualized Return | Annualized performance |
-| Volatility | Realized standard deviation |
-| Sharpe Ratio | Risk-adjusted return |
-| Max Drawdown | Worst peak-to-trough decline |
-| Downside Deviation | Downside semi-deviation |
-| CVaR | Conditional Value-at-Risk |
-
-### Research Metrics
-
-- Newey-West t-statistic (HAC standard errors)
-- Deflated Sharpe Ratio (multiple-testing correction)
-- Bootstrap confidence intervals
-- Crisis period performance attribution
-- Turnover decomposition
-- Liquidity capacity analysis
-
----
-
-## Output Structure
-
+```powershell
+python run_experiment.py --config config/default_config.json --single
 ```
 results/
 └── <run_name>_<timestamp>/
@@ -301,41 +136,40 @@ results/<run_name>_<timestamp>/
 
 **Visualizations include:** reward curves · equity curves · drawdown charts · domain allocations · regime-conditional returns
 
----
+## Outputs
 
-## Running Experiments
+Results are written to:
 
-```bash
-# Single experiment
-python run_experiment.py
+`results/<run_name>_<timestamp>/`
 
-# Batch (multiple seeds + method comparisons)
-python run_experiment.py --batch
+Batch-level artifacts:
+
+- `batch_summary.csv`
+- `batch_summary.json`
+- `batch_cumulative_returns.png`
+
+Per-run artifacts:
+
+- `summary.json`
+- `train_returns.csv`, `test_returns.csv`
+- `losses.csv` (if available)
+- `reward_components.csv`
+- `walk_forward_windows.csv`
+- plots: reward, equity, drawdown, allocation, regime returns
+
+## Branch Notes
+
+- `master`: stable baseline
+- `nondomain`: active research branch (newer modeling/feature experiments)
+
+To switch:
+
+```powershell
+git switch master
+# or
+git switch nondomain
 ```
 
----
+## Disclaimer
 
-## Research Applications
-
-HMADRL is designed for academic experimentation in:
-
-- Hierarchical reinforcement learning architectures
-- Multi-agent portfolio optimization
-- Regime-aware trading strategies
-- Financial stochastic control integration
-- Mixture-of-experts decision routing
-- Reproducible financial RL benchmarks
-
----
-
-## License
-
-**MIT License** — Contributions and experimentation welcome.
-
----
-
-<div align="center">
-
-*Developed as a research framework for hierarchical reinforcement learning in portfolio management.*
-
-</div>
+This repository is for research/engineering experimentation, not financial advice. Live trading requires additional execution, risk, and compliance controls.
