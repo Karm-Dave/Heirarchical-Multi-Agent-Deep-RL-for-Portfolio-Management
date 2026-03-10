@@ -49,7 +49,7 @@ class TestConfigAndData(unittest.TestCase):
         self.assertEqual(config.data.train_split, 0.7)
         self.assertEqual(config.stochastic_control.risk_aversion, 3.0)
         self.assertEqual(config.experiments.results_dir, "results")
-        self.assertIn("equal_weight", config.experiments.methods)
+        self.assertEqual(config.experiments.methods, ["rl", "moe_router"])
 
     def test_build_features_and_states(self) -> None:
         domain_to_stocks = {

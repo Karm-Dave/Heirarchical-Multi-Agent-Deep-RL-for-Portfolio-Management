@@ -99,20 +99,7 @@
     "run_name": "hmadrl_continuous_batch",
     "methods": [
       "rl",
-      "moe_router",
-      "equal_weight",
-      "risk_parity",
-      "hrp",
-      "flat_ppo",
-      "flat_sac",
-      "lstm_portfolio",
-      "transformer_portfolio",
-      "ablation_no_learned_clusters",
-      "ablation_no_stochastic_control",
-      "ablation_no_hold_enforcement",
-      "ablation_no_global_macro",
-      "ablation_no_liquidity",
-      "ablation_static_sectors"
+      "moe_router"
     ],
     "modes": ["rl", "moe_router"],
     "seeds": [42, 84, 126, 256, 512],

@@ -35,3 +35,4 @@ git switch experimental_except_yep
 git reset --hard 9b59960
 # Non-destructive inspection:
 git switch --detach 9b59960
+[2026-03-10 13:48:39] system_only_core checkpoint: git switch system_only_core && git reset --hard HEAD~1

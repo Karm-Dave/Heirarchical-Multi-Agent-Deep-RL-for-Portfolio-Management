@@ -153,19 +153,6 @@ def load_config(path: str | Path) -> ProjectConfig:
     default_methods = [
         "rl",
         "moe_router",
-        "equal_weight",
-        "risk_parity",
-        "hrp",
-        "flat_ppo",
-        "flat_sac",
-        "lstm_portfolio",
-        "transformer_portfolio",
-        "ablation_no_learned_clusters",
-        "ablation_no_stochastic_control",
-        "ablation_no_hold_enforcement",
-        "ablation_no_global_macro",
-        "ablation_no_liquidity",
-        "ablation_static_sectors",
     ]
     methods = [str(m) for m in experiments_raw.get("methods", experiments_raw.get("modes", default_methods))]
     modes = [str(m) for m in experiments_raw.get("modes", [str(raw["top_mode"])])]

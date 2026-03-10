@@ -121,13 +121,14 @@ class TestTemporalClean(unittest.TestCase):
         self.assertAlmostEqual(train_mean, 0.0, places=6)
         self.assertGreater(test_mean, 10.0)
 
-    def test_method_registry_contains_baselines_and_ablation(self) -> None:
+    def test_method_registry_is_system_only(self) -> None:
         cfg = _build_config()
-        self.assertEqual(_method_from_name("equal_weight", cfg).family, "baseline")
-        self.assertEqual(_method_from_name("flat_sac", cfg).family, "baseline")
-        ab = _method_from_name("ablation_no_global_macro", cfg)
-        self.assertEqual(ab.family, "hierarchical")
-        self.assertFalse(ab.use_global_macro_features)
+        self.assertEqual(_method_from_name("rl", cfg).method_id, "rl")
+        self.assertEqual(_method_from_name("moe_router", cfg).method_id, "moe_router")
+        with self.assertRaises(ValueError):
+            _method_from_name("equal_weight", cfg)
+        with self.assertRaises(ValueError):
+            _method_from_name("ablation_no_global_macro", cfg)
 
 
 if __name__ == "__main__":
