@@ -328,12 +328,6 @@ HMADRL is designed for academic experimentation in:
 
 ---
 
-## License
-
-**MIT License** — Contributions and experimentation welcome.
-
----
-
 <div align="center">
 
 *Developed as a research framework for hierarchical reinforcement learning in portfolio management.*
